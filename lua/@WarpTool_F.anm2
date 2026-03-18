@@ -1,0 +1,1952 @@
+@方向波形ワープ(パラメータ)
+--information:方向波形ワープ(パラメータ)@WarpTool_F v0.0.0 by Fu-Majime
+--label:変形\WarpTool_F
+--group:基本設定,true
+--track@height:高さ,0,4000,100
+--track@width:幅,0,4000,100
+--track@rot:回転[度],-3600,3600,0
+--track@period:周期[s],-10,10,1,0.01
+--track@phase:位相[度],-3600,3600,0
+--value@center:中心,{0,0}
+--group:波形,true
+--select@shape:波形=1,サイン=1,矩形=2,三角形=3,のこぎり(正)=4,のこぎり(負)=5,円形=6,半円形(正)=7,半円形(負)=8
+--check@mirror:鏡面反射,0
+--group:ランダム,false
+--track@randHeight:高さランダム[%],0,100,0
+--track@randWidth:幅ランダム[%],0,100,0
+--track@randSeed:ランダムシード,-65536,65535,0,1
+--group:その他,false
+--select@fix:固定処理=1,なし=1,すべて=2,上下=3,左右=4,上=5,下=6,左=7,右=8
+--track@fadePixel:フェード幅[px],0,1000,20
+--value@PI:PI,{}
+
+obj.setanchor("center", 1);
+local WaveWarp_F = require "WaveWarp_F"
+
+--[[pixelshader@psmain:
+Texture2D src : register(t0);
+cbuffer constant0 : register(b0) {
+    float2 resolution;
+    float2 originalResolution;
+    float2 center;
+    float2 originalCenter;
+    float time;
+    float height;
+    float width;
+    float rot;
+    float2 rot1_row0;
+    float2 rot1_row1;
+    float2 rot2_row0;
+    float2 rot2_row1;
+    float period;
+    float shape;
+    float phase;
+    float mirror;
+    float fix;
+    float fadePixel;
+    float randHeight;
+    float randWidth;
+    float randSeed;
+    float debug;
+};
+
+SamplerState s;
+
+// 定数定義
+static const float TAU = 6.28318530718;
+static const float TOLLERANCE = 1e-6;
+
+// 固定タイプ定数
+static const int FIX_NONE = 1;
+static const int FIX_EDGE_ALL = 2;
+static const int FIX_EDGE_VERTICAL = 3;
+static const int FIX_EDGE_HORIZONTAL = 4;
+static const int FIX_EDGE_TOP = 5;
+static const int FIX_EDGE_BOTTOM = 6;
+static const int FIX_EDGE_LEFT = 7;
+static const int FIX_EDGE_RIGHT = 8;
+static const int FIX_CENTER = 9;
+
+// 波形タイプ定数
+static const int WAVE_SINE = 1;
+static const int WAVE_SQUARE = 2;
+static const int WAVE_TRIANGLE = 3;
+static const int WAVE_SAWTOOTH_POS = 4;
+static const int WAVE_SAWTOOTH_NEG = 5;
+static const int WAVE_CIRCLE = 6;
+static const int WAVE_SEMICIRCLE_POS = 7;
+static const int WAVE_SEMICIRCLE_NEG = 8;
+
+// 波のモード定数
+static const int WAVE_MODE_NORMAL = 0;
+static const int WAVE_MODE_MIRROR = 1;
+
+// 関数宣言
+float linearstep(float edge0, float edge1, float x);
+float bezierTransition(float x, float slope, float bend);
+float smoothTransition(float x, float slope);
+float emphasizedTransition(float x, float slope);
+
+float2 applyRotation(float2 coord, float2x2 rotMatrix);
+
+float2 calculateFade(float2 texCoord, float2 warpCoord, float fadePixel, int edgeType);
+float2 applyEdgeClamp(float2 coord, int edgeType);
+
+float calculateWaveInput(float2 rotatedCoord, float width, float phase, float period, float time);
+float applyWaveWidthRandomness(float input, float amount, int waveType);
+float calculateWave(float input, int waveType);
+float applyWaveHeightRandomness(float wave, float input, float amount, int waveType);
+float2 calculateWarpedCoord(float2 texCoord, float2 rotatedCoord,
+                            float wave, float height, float width, float rot, float2x2 rot2,
+                            int waveMode, int fixType);
+                            
+// 整数ハッシュ関数 (0.0 ~ 1.0 を返す)
+float hash1(int n) {
+    n += (int)randSeed;
+    n = (n << 13) ^ n;
+    return (float)((n * (n * n * 17389 + 611953) + 1611623773) & 0x7fffffff) / 2147483647.0;
+}
+float hash2(int n) {
+    n += (int)randSeed;
+    n = (n << 13) ^ n;
+    return (float)((n * (n * n * 27449 + 746773) + 1824261409) & 0x7fffffff) / 2147483647.0;
+}
+
+float4 psmain(float4 pos : SV_Position) : SV_Target {
+    float2 texCoord = pos.xy / resolution;
+    
+    // 回転行列を構築
+    float2x2 rot1 = float2x2(rot1_row0, rot1_row1);
+    float2x2 rot2 = float2x2(rot2_row0, rot2_row1);
+    
+    // 1. 最初の回転を適用
+    float2 rotatedCoord = applyRotation(texCoord, rot1);
+    
+    // 2. 波形入力値を計算
+    float waveInput = calculateWaveInput(rotatedCoord, width, phase, period, time);
+    waveInput = applyWaveWidthRandomness(waveInput, randWidth * 0.01, (int)(shape + 0.5));
+    
+    // 3. 波形を計算
+    int waveType = (int)(shape + 0.5);
+    float wave = calculateWave(waveInput, waveType);
+    wave = applyWaveHeightRandomness(wave, waveInput, randHeight * 0.01, waveType);
+    
+    // 4. ワープされた座標を計算
+    int edgeType = (int)(fix + 0.5);
+    int waveMode = (mirror > 0.5) ? WAVE_MODE_MIRROR : WAVE_MODE_NORMAL;
+    float2 finalCoord = calculateWarpedCoord(texCoord, rotatedCoord, wave, height, width, rot, rot2, waveMode, edgeType);
+    
+    // デバッグモード分岐
+    if (debug > 0.5) {
+    }
+    
+    return src.Sample(s, finalCoord);
+}
+
+// 回転を適用する関数
+float2 applyRotation(float2 coord, float2x2 rotMatrix) {
+    // originalCenterを正規化座標系での回転中心として使用
+    float2 centerNormalized = originalCenter / resolution;
+    return mul((coord - centerNormalized) * resolution, rotMatrix) / resolution + centerNormalized;
+}
+
+///// calculateFade用ヘルパー関数
+// 1.0 - bezierTransition(1.0 - x, 1.0, 1 - slope/3)
+// 数学的には: x + x² - x³
+float simpleTransitionSlope1Inverted(float x) {
+    x = clamp(x, 0.0, 1.0);
+    float x2 = x * x;
+    float x3 = x2 * x;
+    return x + x2 - x3;
+}
+
+float reinhard_weight(float x, float knee_threshold) {
+    return (knee_threshold + max(0.0, -x)) / (knee_threshold + max(0.0, x));
+}
+
+// エッジフェード係数を計算するヘルパー関数
+float2 computeEdgeFade(float normalizedDist, float simpleDist, float warpAmount, float fadeWidth) {
+    // float fadeEdge = 1.0 - bezierTransition(1.0 - simpleDist, 1.0, 2.0/3.0);
+    float fadeEdge = simpleTransitionSlope1Inverted(simpleDist);
+    float slope = reinhard_weight(warpAmount, fadeWidth);
+    float fadeWarp = emphasizedTransition(normalizedDist, slope);
+    return float2(fadeWarp, fadeEdge);
+}
+///// calculateFade用ヘルパー関数
+
+float2 calculateFade(float2 texCoord, float2 warpCoord, float fadePixel, int edgeType) {
+    float fadeWidthU = fadePixel / resolution.x;
+    float fadeWidthV = fadePixel / resolution.y;
+
+    // 左エッジ: X軸の正方向からのフェード (warp, edge)
+    float leftNormalizedDist = texCoord.x / (fadeWidthU + max(0.0, -warpCoord.x));
+    float leftSimpleDist = texCoord.x / fadeWidthU;
+    float2 fadeLeft = computeEdgeFade(leftNormalizedDist, leftSimpleDist, warpCoord.x, fadeWidthU);
+
+    // 右エッジ: X軸の負方向からのフェード (warp, edge)
+    float rightNormalizedDist = (1.0 - texCoord.x) / (fadeWidthU + max(0.0, warpCoord.x));
+    float rightSimpleDist = (1.0 - texCoord.x) / fadeWidthU;
+    float2 fadeRight = computeEdgeFade(rightNormalizedDist, rightSimpleDist, -warpCoord.x, fadeWidthU);
+
+    // 上エッジ: Y軸の正方向からのフェード (warp, edge)
+    float topNormalizedDist = texCoord.y / (fadeWidthV + max(0.0, -warpCoord.y));
+    float topSimpleDist = texCoord.y / fadeWidthV;
+    float2 fadeTopRaw = computeEdgeFade(topNormalizedDist, topSimpleDist, warpCoord.y, fadeWidthV);
+    float2 fadeTop = float2(fadeTopRaw.y, fadeTopRaw.x);
+
+    // 下エッジ: Y軸の負方向からのフェード (warp, edge)
+    float bottomNormalizedDist = (1.0 - texCoord.y) / (fadeWidthV + max(0.0, warpCoord.y));
+    float bottomSimpleDist = (1.0 - texCoord.y) / fadeWidthV;
+    float2 fadeBottomRaw = computeEdgeFade(bottomNormalizedDist, bottomSimpleDist, -warpCoord.y, fadeWidthV);
+    float2 fadeBottom = float2(fadeBottomRaw.y, fadeBottomRaw.x);
+
+    // 中央固定: 中央のとき0.0、一番端で1.0にする
+    // 中央の定義は、端のfadePixel分を除いた範囲
+    float2 fadeCenter;
+    {
+        float centerMinX = fadeWidthU + warpCoord.x;
+        float centerMaxX = 1.0 - fadeWidthU + warpCoord.x;
+        float centerMinY = fadeWidthV + warpCoord.y;
+        float centerMaxY = 1.0 - fadeWidthV + warpCoord.y;
+        if (texCoord.x >= centerMinX && texCoord.x <= centerMaxX &&
+            texCoord.y >= centerMinY && texCoord.y <= centerMaxY) {
+            fadeCenter = float2(0.0, 0.0);
+        } else {
+            fadeCenter = float2(1.0, 1.0);
+        }
+    }
+    {
+        float centerMinX = fadeWidthU;
+        float centerMaxX = 1.0 - fadeWidthU;
+        float centerMinY = fadeWidthV;
+        float centerMaxY = 1.0 - fadeWidthV;
+        
+        // X軸方向のフェード計算
+        float fadeCenterX;
+        if (texCoord.x >= centerMinX && texCoord.x <= centerMaxX) {
+            fadeCenterX = 0.0; // 中央領域内は0.0
+        } else if (texCoord.x < centerMinX) {
+            // 左端からのフェード (端で1.0、中央境界で0.0)
+            fadeCenterX = 1.0 - simpleTransitionSlope1Inverted(texCoord.x / fadeWidthU);
+        } else {
+            // 右端からのフェード (端で1.0、中央境界で0.0)
+            fadeCenterX = 1.0 - simpleTransitionSlope1Inverted((1.0 - texCoord.x) / fadeWidthU);
+        }
+        
+        // Y軸方向のフェード計算
+        float fadeCenterY;
+        if (texCoord.y >= centerMinY && texCoord.y <= centerMaxY) {
+            fadeCenterY = 0.0; // 中央領域内は0.0
+        } else if (texCoord.y < centerMinY) {
+            // 上端からのフェード (端で1.0、中央境界で0.0)
+            fadeCenterY = 1.0 - simpleTransitionSlope1Inverted(texCoord.y / fadeWidthV);
+        } else {
+            // 下端からのフェード (端で1.0、中央境界で0.0)
+            fadeCenterY = 1.0 - simpleTransitionSlope1Inverted((1.0 - texCoord.y) / fadeWidthV);
+        }
+        
+        // 両軸の最大値を取る（矩形フェード領域）
+        float fadeCenterValue = max(fadeCenterX, fadeCenterY);
+        fadeCenter = float2(fadeCenterValue, fadeCenterValue);
+    }
+
+
+  
+
+    switch (edgeType) {
+        case FIX_EDGE_ALL:        return min(fadeLeft * fadeRight, fadeTop * fadeBottom);
+        case FIX_EDGE_VERTICAL:   return fadeTop * fadeBottom;
+        case FIX_EDGE_HORIZONTAL: return fadeLeft * fadeRight;
+        case FIX_EDGE_TOP:        return fadeTop;
+        case FIX_EDGE_BOTTOM:     return fadeBottom;
+        case FIX_EDGE_LEFT:       return fadeLeft;
+        case FIX_EDGE_RIGHT:      return fadeRight;
+        case FIX_CENTER:          return fadeCenter;
+        default:                  return float2(1.0, 1.0);
+    }
+}
+
+// エッジタイプに応じた座標クランプ関数
+float2 applyEdgeClamp(float2 coord, int edgeType) {
+    float minBoundX = 1.0 / resolution.x;  // 最小境界（1ピクセル）
+    float maxBoundX = 1.0 - minBoundX;
+    float minBoundY = 1.0 / resolution.y;
+    float maxBoundY = 1.0 - minBoundY;
+    
+    switch (edgeType) {
+        case FIX_EDGE_ALL:
+            // 全方向クランプ
+            return float2(clamp(coord.x, minBoundX, maxBoundX), clamp(coord.y, minBoundY, maxBoundY));
+            
+        case FIX_EDGE_VERTICAL:
+            // Y方向のみクランプ
+            return float2(coord.x, clamp(coord.y, minBoundY, maxBoundY));
+            
+        case FIX_EDGE_HORIZONTAL:
+            // X方向のみクランプ
+            return float2(clamp(coord.x, minBoundX, maxBoundX), coord.y);
+            
+        case FIX_EDGE_TOP:
+            // 上エッジのみクランプ
+            return float2(coord.x, max(coord.y, minBoundY));
+            
+        case FIX_EDGE_BOTTOM:
+            // 下エッジのみクランプ
+            return float2(coord.x, min(coord.y, maxBoundY));
+            
+        case FIX_EDGE_LEFT:
+            // 左エッジのみクランプ
+            return float2(max(coord.x, minBoundX), coord.y);
+            
+        case FIX_EDGE_RIGHT:
+            // 右エッジのみクランプ
+            return float2(min(coord.x, maxBoundX), coord.y);
+            
+        case FIX_NONE:
+        default:
+            // クランプなし
+            return coord;
+    }
+}
+
+float calculateWaveInput(float2 rotatedCoord, float width, float phase, float period, float time) {
+    float baseX = (rotatedCoord.x - originalCenter.x / resolution.x) * resolution.x;
+    
+    float waveInput = baseX / width + phase;
+    if (abs(period) > 0) {
+        waveInput += time / period;
+    }
+    
+    return waveInput;
+}
+
+float ReLU(float x) {
+    return max(0.0, x);
+}
+
+// ワープオフセットのみを計算する関数
+float calculateWarpOffset(float2 rotatedCoord, float wave, float height, float rot, int waveMode) {
+    float baseWarp = height / resolution.y * wave;
+    switch (waveMode) {
+        case WAVE_MODE_MIRROR: {
+            float sinr = abs(sin(rot));
+            float cosr = abs(cos(rot));
+            // 鏡面反射ワープ処理
+            float2 normalizedCenter = originalCenter / resolution;
+            float relativeY = 2.0 * (normalizedCenter.y - rotatedCoord.y);
+
+            float rotatedExtentUV = ((originalResolution.x + 2 * abs(center.x)) * sinr + (originalResolution.y + 2 * abs(center.y)) * cosr) / resolution.y;
+            float warpOffset = relativeY * baseWarp / (2.0 * baseWarp + rotatedExtentUV);
+
+            return warpOffset;
+        }
+
+        case WAVE_MODE_NORMAL:
+        default: {
+            // 通常のワープ処理
+            return baseWarp;
+        }
+    }
+}
+
+// ワープされた座標を計算する関数
+float2 calculateWarpedCoord(float2 texCoord, float2 rotatedCoord,
+                            float wave, float height, float width, float rot, float2x2 rot2,
+                            int waveMode, int fixType) {
+    float warpOffset = calculateWarpOffset(rotatedCoord, wave, height, rot, waveMode);
+    {
+        float A = fadePixel + height * 2;
+        // warpOffset = warpOffset * ReLU((A / resolution.y  - texCoord.y) / (warpOffset + (A - height) / resolution.y));
+    }
+    float2 warpCoord = mul(float2(0, warpOffset) * resolution, rot2) / resolution;
+    float2 fade = calculateFade(texCoord, warpCoord, fadePixel, fixType);
+    float2 warped = texCoord + warpCoord * fade;
+    return applyEdgeClamp(warped, fixType);
+}
+
+// ランダム値の累積数列の近似
+float stepNoise(int n, float amplitude) {
+    float t = (float)n / 2.0 + hash2(n) / 2.0;
+    return lerp((float)n, t, amplitude);
+}
+
+// stepNoise(index) <= x < stepNoise(index+1) を満たすindexを見つける
+int estimateStepNoiseIndex(float x, float amplitude) {
+    int indexApprox = (int)floor(x / (1.0 - amplitude * 0.5));
+    float stepNoiseValue = stepNoise(indexApprox, amplitude);
+    int isGreater = (stepNoiseValue > x) ? 1 : 0;
+    return indexApprox - isGreater;
+}
+
+float applyWaveWidthRandomness(float input, float amount, int waveType) {
+    switch (waveType) {
+        case WAVE_SQUARE:
+        case WAVE_SEMICIRCLE_POS:
+        case WAVE_SEMICIRCLE_NEG: {
+            float scaledInput = 2.0 * input;
+            int index = estimateStepNoiseIndex(scaledInput, amount);            
+            return 0.5 * index
+            + 0.5 * (scaledInput - stepNoise(index, amount))
+            / (stepNoise(index + 1, amount) - stepNoise(index, amount));
+        }
+        case WAVE_SAWTOOTH_POS:
+        case WAVE_SAWTOOTH_NEG: {
+            int index = estimateStepNoiseIndex(input, amount);            
+            return index
+            + (input - stepNoise(index, amount))
+            / (stepNoise(index + 1, amount) - stepNoise(index, amount));
+        }
+        case WAVE_SINE:
+        case WAVE_TRIANGLE:
+        case WAVE_CIRCLE: {
+            float scaledInput = 2.0 * input + 0.5;
+            int index = estimateStepNoiseIndex(scaledInput, amount);            
+            return 0.5 * index - 0.25
+            + 0.5 * (scaledInput - stepNoise(index, amount))
+            / (stepNoise(index + 1, amount) - stepNoise(index, amount));
+        }
+        default:
+            return input;
+    }
+}
+
+float applyWaveHeightRandomness(float wave, float input, float amount, int waveType) {
+    switch (waveType) {
+        case WAVE_SQUARE: {
+            float amp = 1.0 - hash1((int)floor(2 * input)) * amount;
+            return wave * amp;
+        }
+        case WAVE_SAWTOOTH_POS:
+        case WAVE_SAWTOOTH_NEG: {
+            float amp = 1.0 - hash1(2 * (int)floor(input)) * amount;
+            return wave * amp;
+        }
+        case WAVE_SINE:
+        case WAVE_TRIANGLE:
+        case WAVE_CIRCLE: {
+            float amp0 = 0, amp1 = 0;
+            if (frac(input + 0.25) < 0.5) {
+                amp0 = 1.0 - hash1((int)floor(2 * input - 0.5)) * amount;
+                amp1 = 1.0 - hash1((int)floor(2 * input + 0.5)) * amount;
+                return ((amp1 + amp0) * wave + (amp1 - amp0)) * 0.5;
+            } else {
+                amp0 = 1.0 - hash1((int)floor(2 * input - 0.5)) * amount;
+                amp1 = 1.0 - hash1((int)floor(2 * input + 0.5)) * amount;
+                return ((amp1 + amp0) * wave + (amp0 - amp1)) * 0.5;
+            }
+        }
+        case WAVE_SEMICIRCLE_POS:
+        case WAVE_SEMICIRCLE_NEG: {
+            float amp0 = 0, amp1 = 0;
+            if (frac(input) < 0.5) {
+                amp0 = 1.0 - hash1((int)floor(2 * input - 1.0)) * amount;
+                amp1 = 1.0 - hash1((int)floor(2 * input)) * amount;
+                return ((amp1 + amp0) * wave + (amp1 - amp0)) * 0.5;
+            } else {
+                amp0 = 1.0 - hash1((int)floor(2 * input - 1.0)) * amount;
+                amp1 = 1.0 - hash1((int)floor(2 * input)) * amount;
+                return ((amp1 + amp0) * wave + (amp0 - amp1)) * 0.5;
+            }
+        }
+        default:
+            return wave;
+    }
+}
+
+float calculateWave(float input, int waveType) {
+    switch (waveType) {
+        case WAVE_SINE:
+            return sin(TAU * input);
+            
+        case WAVE_SQUARE:
+            return sign(sin(TAU * input));
+            
+        case WAVE_TRIANGLE:
+            return (1.0 - 4.0 * abs(0.5 - frac(input + 0.25)));
+            
+        case WAVE_SAWTOOTH_POS:
+            return 2.0 * frac(input) - 1.0;
+            
+        case WAVE_SAWTOOTH_NEG:
+            return 1.0 - 2.0 * frac(input);
+            
+        case WAVE_CIRCLE: {
+            float r = frac(input);
+            float val1 = -16.0 * r * r + 8.0 * r;
+            float val2 = -16.0 * r * r + 24.0 * r - 8.0;
+            if (val1 > 0) {
+                return sqrt(val1);
+            } else if (val2 > 0) {
+                return -sqrt(val2);
+            } else {
+                return 0;
+            }
+        }
+        
+        case WAVE_SEMICIRCLE_POS: {
+            float r = frac(input);
+            return sqrt(-16.0 * r * r + 16.0 * r) - 1;
+        }
+        
+        case WAVE_SEMICIRCLE_NEG: {
+            float r = frac(input);
+            return 1 - sqrt(-16.0 * r * r + 16.0 * r);
+        }
+        
+        default:
+            return sin(TAU * input); // デフォルトはサイン
+    }
+}
+
+// linearstep関数の実装
+// edge0=0, edge1=0+0のとき、[0,1]で1を返す
+float linearstep(float edge0, float edge1, float x) {
+    if (edge0 == edge1) {
+        return x >= edge0 ? 1.0 : 0.0;
+    }
+    return clamp((x - edge0) / (edge1 - edge0), 0.0, 1.0);
+}
+
+float bezierTransition(float x, float slope, float bend) {
+    x = clamp(x, 0.0, 1.0);
+    
+    // ベジエ曲線の陽関数解: 傾き0からslopeに変化
+    // 3*bend*t^2 + (1-3*bend)*t^3 の逆関数
+    
+    // 判別式の計算
+    float discriminant_base = (3.0 - 2.0*slope - 3.0*bend);
+    float discriminant = discriminant_base * discriminant_base - 4.0*slope*(-3.0 + slope + 3.0*bend)*x;
+    
+    // 平方根の計算（負の場合は0にクランプ）
+    float sqrt_discriminant = sqrt(max(0.0, discriminant));
+    
+    // t の計算
+    float denominator = 2.0 * (-3.0 + slope + 3.0*bend);
+    float t = (-discriminant_base - sqrt_discriminant) / denominator;
+    
+    // 結果の計算: 3*bend*t^2 + (1-3*bend)*t^3
+    return t*t * (3.0*bend + (1.0 - 3.0*bend) * t);
+}
+
+// 滑らかな遷移曲線関数
+// x=0で値0、x=1で値1,傾きslopeになる滑らかな曲線
+// bezierTransition bend = 1/3
+float smoothTransition(float x, float slope) {
+    x = clamp(x, 0.0, 1.0);  // 境界値処理を統合
+    
+    if (slope <= 1.0) {
+        // 開始時傾き無限大: (2s-1)x + (2-2s)√x
+        return (2.0 * slope - 1.0) * x + (2.0 - 2.0 * slope) * sqrt(x);
+    }
+    
+    if (abs(slope - 2.0) < TOLLERANCE) {
+        // 特別ケース: x²
+        return x * x;
+    }
+    
+    // 開始時傾き0: ((s-1) - √(1 - s(s-2)(x-1))) / (s-2))²
+    float t = ((slope - 1.0) - sqrt(max(0.0, 1.0 - slope * (slope - 2.0) * (x - 1.0)))) / (slope - 2.0);
+    return t * t;
+}
+
+float emphasizedTransition(float x, float slope) {
+    // xの範囲をあらかじめ安全にしておく
+    x = clamp(x, 0.0, 1.0);
+    
+    // slope <= 1.0 のときは数学的に一定値 (2√x - x)
+    if (slope <= 1.0) {
+        return 2.0 * sqrt(x) - x;
+    }
+
+    // 通常ケース
+    // g(x, a) = ( f(x, a) - a * f(x, 1) ) / (1 - a)
+    // ここで f(x, 1) = x であるため、単純に slope * x となる
+    return (smoothTransition(x, slope) - slope * x) / (1.0 - slope);
+}
+]]
+
+-- メイン処理
+local function main()
+    -- パラメータの初期化（PIパラメータインジェクション対応）
+    local rot_rad = (tonumber(PI.rot) or rot) / 180 * math.pi
+    local phase_normalized = ((tonumber(PI.phase) or phase) or 0) / 360
+    
+    -- ゼロ値チェック（PIパラメータインジェクション対応）
+    local current_height = tonumber(PI.height) or height
+    local current_width = tonumber(PI.width) or width
+    if current_height == 0 or current_width == 0 then
+        return
+    end
+
+    if type(PI.center) == "table" then
+        local cx, cy = tonumber(PI.center[1]), tonumber(PI.center[2]);
+        if cx and cy then
+            center = { cx, cy };
+        end
+    end
+    
+    -- 領域拡張前の解像度を取得
+    local orig_w, orig_h = obj.getpixel()
+
+    -- 領域拡張の計算と適用
+    mirror = tonumber(PI.mirror) or mirror
+    local expansionParams = WaveWarp_F.calculateExpansionParams(current_height, rot_rad, tonumber(PI.fix) or fix, mirror, center, orig_w, orig_h)
+    obj.effect("領域拡張", "上", expansionParams[1], "下", expansionParams[2], 
+               "右", expansionParams[3], "左", expansionParams[4])
+    obj.cx = obj.cx + (expansionParams[4] - expansionParams[3]) * 0.5
+    obj.cy = obj.cy + (expansionParams[1] - expansionParams[2]) * 0.5
+
+    -- ピクセルサイズ取得
+    local w, h = obj.getpixel()
+    
+    local rotMatrix = WaveWarp_F.createRotationMatrix(rot_rad)
+    
+    -- 鏡面反射用の元画像中心座標を計算（ピクセル単位）
+    local topExpansion, bottomExpansion, rightExpansion, leftExpansion = 
+        expansionParams[1], expansionParams[2], expansionParams[3], expansionParams[4]
+    local originalCenterX = leftExpansion + orig_w * 0.5 + center[1]
+    local originalCenterY = topExpansion + orig_h * 0.5 + center[2]
+    
+    -- シード値の計算 (AviUtlのobj.randを利用)
+    local user_seed = tonumber(PI.randSeed) or randSeed
+    -- フレーム0固定でシードを生成（時間経過で波の形が変わらないようにするため）
+    local shader_seed = obj.rand(0, 2147483647, user_seed, 0)
+    
+    -- シェーダーパラメータの構築（PIパラメータインジェクション対応）
+    local shaderParams = {
+        -- 解像度（領域拡張後）
+        w, h,
+        -- 元の解像度（領域拡張前）
+        orig_w, orig_h,
+        center[1], center[2],
+        originalCenterX, originalCenterY,
+        -- 時間s
+        obj.time,
+        -- エフェクトパラメータ
+        current_height,
+        current_width,
+        rot_rad,
+        -- 回転行列 (正方向)
+        rotMatrix[1], rotMatrix[2], rotMatrix[3], rotMatrix[4],
+        -- 回転行列 (逆方向)
+        rotMatrix[1], -rotMatrix[2], -rotMatrix[3], rotMatrix[4],
+        -- その他パラメータ
+        tonumber(PI.period) or period,
+        tonumber(PI.shape) or shape or 1,
+        phase_normalized,
+        mirror,
+        tonumber(PI.fix) or fix,
+        tonumber(PI.fadePixel) or fadePixel,
+        tonumber(PI.randHeight) or randHeight,
+        tonumber(PI.randWidth) or randWidth,
+        shader_seed,
+        tonumber(PI.debug) or debug,
+    }
+    
+    -- シェーダー適用
+    obj.pixelshader("psmain", "object", {"object"}, shaderParams, "copy")
+end
+
+-- メイン処理実行
+main()
+
+
+@方向波形ワープ(配置)
+--information:方向波形ワープ(配置)@WarpTool_F v0.0.0 by Fu-Majime
+--label:変形\WarpTool_F
+--group:基本設定,true
+--value@waveLayout:波形配置,{0,-100,0,0,100,0}
+--track@period:周期[s],-10,10,1,0.01
+--track@phase:位相[度],-3600,3600,0
+--group:波形,true
+--select@shape:波形=1,サイン=1,矩形=2,三角形=3,のこぎり(正)=4,のこぎり(負)=5,円形=6,半円形(正)=7,半円形(負)=8
+--check@mirror:鏡面反射,0
+--group:ランダム,false
+--track@randHeight:高さランダム[%],0,100,0
+--track@randWidth:幅ランダム[%],0,100,0
+--track@randSeed:ランダムシード,-65536,65535,0,1
+--group:その他,false
+--select@fix:固定処理=1,なし=1,すべて=2,上下=3,左右=4,上=5,下=6,左=7,右=8
+--track@fadePixel:フェード幅[px],0,1000,20
+--value@PI:PI,{}
+
+obj.setanchor("waveLayout", 3, "line")
+local WaveWarp_F = require "WaveWarp_F"
+
+
+-- ローカル関数定義
+local function createRotationMatrix(angle)
+    local cos_a = math.cos(angle)
+    local sin_a = math.sin(angle)
+    return { cos_a, -sin_a, sin_a, cos_a }
+end
+
+local function distancePointToLine(x1, y1, x2, y2, px, py)
+    local dx = x2 - x1
+    local dy = y2 - y1
+    local line_length = math.sqrt(dx * dx + dy * dy)
+    
+    if line_length == 0 then
+        -- 2点が同じ場合は点間の距離
+        return math.sqrt((px - x1) * (px - x1) + (py - y1) * (py - y1))
+    end
+    
+    -- 点と直線の距離の公式: |ax + by + c| / sqrt(a^2 + b^2)
+    -- 直線の方程式: dy * x - dx * y + (dx * y1 - dy * x1) = 0
+    local a = dy
+    local b = -dx
+    local c = dx * y1 - dy * x1
+    
+    return math.abs(a * px + b * py + c) / line_length
+end
+
+-- メイン処理
+local function main()
+    -- パラメータの初期化（PIパラメータインジェクション対応）
+    local X, Y = waveLayout[1], waveLayout[2]
+    local center = { waveLayout[3], waveLayout[4] }
+    if type(PI.waveLayout) == "table" then
+        X, Y = tonumber(PI.waveLayout[1]) or waveLayout[1], tonumber(PI.waveLayout[2]) or waveLayout[2]
+        local cx, cy = tonumber(PI.waveLayout[3]), tonumber(PI.waveLayout[4]);
+        if cx and cy then
+            center = { cx, cy };
+        end
+        waveLayout[5] = tonumber(PI.waveLayout[5]) or waveLayout[5]
+        waveLayout[6] = tonumber(PI.waveLayout[6]) or waveLayout[6]
+    end
+	
+    local height = math.sqrt((X - center[1]) * (X - center[1]) + (Y - center[2]) * (Y - center[2]))
+    local width = distancePointToLine(center[1], center[2], X, Y, waveLayout[5], waveLayout[6])
+    local rot = math.deg(math.atan2(Y - center[2], X - center[1])) + 90
+
+    local rot_rad = (tonumber(PI.rot) or rot) / 180 * math.pi
+    local phase_normalized = ((tonumber(PI.phase) or phase) or 0) / 360
+    
+    -- ゼロ値チェック（PIパラメータインジェクション対応）
+    local current_height = tonumber(PI.height) or height
+    local current_width = tonumber(PI.width) or width
+    if current_height == 0 or current_width == 0 then
+        return
+    end
+    
+    -- 領域拡張前の解像度を取得
+    local orig_w, orig_h = obj.getpixel()
+
+    -- 領域拡張の計算と適用
+    mirror = tonumber(PI.mirror) or mirror
+    local expansionParams = WaveWarp_F.calculateExpansionParams(current_height, rot_rad, tonumber(PI.fix) or fix, mirror, center, orig_w, orig_h)
+    obj.effect("領域拡張", "上", expansionParams[1], "下", expansionParams[2], 
+               "右", expansionParams[3], "左", expansionParams[4])
+    obj.cx = obj.cx + (expansionParams[4] - expansionParams[3]) * 0.5
+    obj.cy = obj.cy + (expansionParams[1] - expansionParams[2]) * 0.5
+
+    -- ピクセルサイズ取得
+    local w, h = obj.getpixel()
+    local rotMatrix = createRotationMatrix(rot_rad)
+    
+    -- 鏡面反射用の元画像中心座標を計算（ピクセル単位）
+    local topExpansion, bottomExpansion, rightExpansion, leftExpansion = 
+        expansionParams[1], expansionParams[2], expansionParams[3], expansionParams[4]
+    local originalCenterX = leftExpansion + orig_w * 0.5 + center[1]
+    local originalCenterY = topExpansion + orig_h * 0.5 + center[2]
+    
+    -- シード値の計算 (AviUtlのobj.randを利用)
+    local user_seed = tonumber(PI.randSeed) or randSeed
+    -- フレーム0固定でシードを生成（時間経過で波の形が変わらないようにするため）
+    local shader_seed = obj.rand(0, 2147483647, user_seed, 0)
+    
+    -- シェーダーパラメータの構築（PIパラメータインジェクション対応）
+    local shaderParams = {
+        -- 解像度（領域拡張後）
+        w, h,
+        -- 元の解像度（領域拡張前）
+        orig_w, orig_h,
+        center[1], center[2],
+        originalCenterX, originalCenterY,
+        -- 時間s
+        obj.time,
+        -- エフェクトパラメータ
+        current_height,
+        current_width,
+        rot_rad,
+        -- 回転行列 (正方向)
+        rotMatrix[1], rotMatrix[2], rotMatrix[3], rotMatrix[4],
+        -- 回転行列 (逆方向)
+        rotMatrix[1], -rotMatrix[2], -rotMatrix[3], rotMatrix[4],
+        -- その他パラメータ
+        tonumber(PI.period) or period,
+        tonumber(PI.shape) or shape or 1,
+        phase_normalized,
+        mirror,
+        tonumber(PI.fix) or fix,
+        tonumber(PI.fadePixel) or fadePixel,
+        tonumber(PI.randHeight) or randHeight,
+        tonumber(PI.randWidth) or randWidth or 0,
+        shader_seed,
+        tonumber(PI.debug) or debug,
+    }
+    
+    -- シェーダー適用
+    obj.pixelshader("psmain@方向波形ワープ(パラメータ)@WarpTool_F", "object", {"object"}, shaderParams, "copy")
+end
+
+-- メイン処理実行
+main()
+
+@放射回転波形ワープ(没)
+--information:放射回転波形ワープ(パラメータ)@WarpTool_F v0.0.0 by Fu-Majime
+--label:変形\WarpTool_F
+--group:基本設定,true
+--value@center:中心,{0,0}
+--select@shape:波形=1,サイン=1,矩形=2,三角形=3,のこぎり(正)=4,のこぎり(負)=5,円形=6,半円形(正)=7,半円形(負)=8
+--track@period:周期[s],-1000,1000,8,0.01
+--group:放射波,true
+--track@radAmp:放射振幅[px],0,4000,100
+--track@radFreq:放射周波数[回],0,1000,8,0.01
+--track@radPhase:放射位相[度],-3600,3600,0
+--group:回転波,true
+--track@rotAmp:回転振幅[度],-3600,3600,90
+--track@rotRadius:回転半径[px],0,4000,100
+--track@rotPhase:回転位相[度],-3600,3600,0
+--group:螺旋,false
+--track@spiralMix:螺旋ねじれ,-2,2,0,0.01
+--group:その他,false
+--check@debug:デバッグモード,0
+--value@PI:PI,{}
+
+obj.setanchor("center", 1);
+local WaveWarp_F = require "WaveWarp_F"
+
+--[[pixelshader@psmain:
+Texture2D src : register(t0);
+cbuffer constant0 : register(b0) {
+    float2 resolution;
+    float2 originalResolution;
+    float2 center;
+    float2 originalCenter;
+    float time;
+    float period;
+    float radAmp;
+    float radFreq;
+    float shape;
+    float radPhase;
+    float spiralMix;
+    float rotAmp;
+    float rotRadius;
+    float rotPhase;
+    float debug;
+    float debug_A;
+    float debug_B;
+};
+
+SamplerState s;
+
+static const float TAU = 6.28318530718;
+
+static const int WAVE_SINE = 1;
+static const int WAVE_SQUARE = 2;
+static const int WAVE_TRIANGLE = 3;
+static const int WAVE_SAWTOOTH_POS = 4;
+static const int WAVE_SAWTOOTH_NEG = 5;
+static const int WAVE_CIRCLE = 6;
+static const int WAVE_SEMICIRCLE_POS = 7;
+static const int WAVE_SEMICIRCLE_NEG = 8;
+
+float inverse_x_plus_log(float y);
+float inverse_weighted_log_linear(float y, float alpha, float beta);
+
+float hash1(int n) {
+    n += 12345; // simple seed
+    n = (n << 13) ^ n;
+    return (float)((n * (n * n * 15731 + 789221) + 1376312627) & 0x7fffffff) / 2147483647.0;
+}
+
+float calculateWave(float input, int waveType) {
+    switch (waveType) {
+        case WAVE_SINE:
+            return sin(TAU * input);
+        case WAVE_SQUARE:
+            return sign(sin(TAU * input));
+        case WAVE_TRIANGLE:
+            return (1.0 - 4.0 * abs(0.5 - frac(input + 0.25)));
+        case WAVE_SAWTOOTH_POS:
+            return 2.0 * frac(input) - 1.0;
+        case WAVE_SAWTOOTH_NEG:
+            return 1.0 - 2.0 * frac(input);
+        case WAVE_CIRCLE: {
+            float r = frac(input);
+            float val1 = -16.0 * r * r + 8.0 * r;
+            float val2 = -16.0 * r * r + 24.0 * r - 8.0;
+            if (val1 > 0) {
+                return sqrt(val1);
+            } else if (val2 > 0) {
+                return -sqrt(val2);
+            } else {
+                return 0;
+            }
+        }
+        case WAVE_SEMICIRCLE_POS: {
+            float r = frac(input);
+            return sqrt(-16.0 * r * r + 16.0 * r) - 1;
+        }
+        case WAVE_SEMICIRCLE_NEG: {
+            float r = frac(input);
+            return 1 - sqrt(-16.0 * r * r + 16.0 * r);
+        }
+        default:
+            return sin(TAU * input);
+    }
+}
+
+float4 psmain(float4 pos : SV_Position) : SV_Target {
+    float2 texCoord = pos.xy / resolution;
+    
+    float2 centerUV = originalCenter / resolution;
+    float2 p = (texCoord - centerUV) * resolution;
+    
+    float r = length(p);
+    float theta = atan2(p.y, p.x);
+
+    
+    float waveInput = (theta / TAU + radPhase) * radFreq;
+    if (abs(period) > 0) {
+        waveInput += time / period * radFreq;
+    }
+    
+    int waveType = (int)(shape + 0.5);
+    float wave = calculateWave(waveInput, waveType);
+    
+    float rotInput = r / rotRadius + rotPhase;
+    if (abs(period) > 0) rotInput += time / period;
+    float rotWave = calculateWave(rotInput, waveType);
+
+    float2 newTexCoord = texCoord;
+    // 放射モード
+    if (false)
+    {
+        float n = max(1.0, abs(radFreq));
+        float BaseRadius = max(originalResolution.x/2, originalResolution.y/2);
+        float Rmax = max(BaseRadius + radAmp, 1e-6);
+        float Rmin = max(BaseRadius - radAmp, 1e-6);
+        float pi_over_n = TAU / 2 / n;
+        float tan_alpha = (Rmax / Rmin - cos(pi_over_n)) / sin(pi_over_n);
+        float alpha = atan(tan_alpha);
+        float term = TAU * (wave + 1.0) / 4.0;
+        
+        float limit_ratio = (1.0 - cos(pi_over_n)) / (1.0 + cos(pi_over_n));
+        float h_limit = BaseRadius * limit_ratio;
+        float straightness = smoothstep(0.0, h_limit, abs(radAmp));
+        straightness = clamp(abs(radAmp) / h_limit, 0.0, 1.0);
+        // straightness = 1;
+
+        float denom_poly = cos(term / n - alpha);
+        float denom_circle = cos(alpha);
+        float denom = lerp(denom_circle, denom_poly, straightness);
+        float newR = Rmax * cos(alpha) / denom;
+        float2 newP = p * (BaseRadius / (BaseRadius + radAmp) / 2.0) / newR;
+        float2 aspectCorrection = float2((2.0 * BaseRadius + 2.0 * radAmp) / resolution.x, (2.0 * BaseRadius + 2.0 * radAmp) / resolution.y);
+        newTexCoord = centerUV + newP * aspectCorrection;
+    
+        if (debug > 0.5) {
+            float inner = max(BaseRadius - abs(radAmp), 1e-6);
+            float outer = max(BaseRadius + abs(radAmp), inner + 1e-6);
+            float ginfo = smoothstep(inner, outer, r); // 0=中心側、1=外側（radAmp影響域の割合）
+            return float4(frac(radFreq * theta / TAU), 0, -1 * 0.5 + 0.5, 1.0);
+        }
+    }
+    // 回転モード
+    else if (false)
+    {
+        float angleOffset = rotWave * rotAmp * TAU;
+        float newTheta = theta - angleOffset;
+        float2 newP_rot = float2(cos(newTheta), sin(newTheta)) * r;
+        newTexCoord = centerUV + newP_rot / resolution;
+    }
+    // 螺旋モード
+    {
+        // スパイラル座標系に変換
+        float twistSin = sin(spiralMix * TAU / 4.0);
+        float twistCos = cos(spiralMix * TAU / 4.0);
+        float twistTan = tan(spiralMix * TAU / 4.0);
+
+        // 極座標の計算（rはlogをとる）
+        float logR = log(r + 1e-6);
+
+        // 基本のu, vを計算
+        float u = twistCos * logR - twistSin * (theta + 0*TAU * round((logR / twistTan - theta) / TAU));
+        float v = twistSin * logR + twistCos * (theta + 0*TAU * round((logR / twistTan - theta) / TAU));
+        
+
+        // 波形を計算
+        float phase_adjusted = radPhase;
+        float rot_phase_adjusted = rotPhase;
+        if (abs(period) > 0) {
+            phase_adjusted += time / period;
+            rot_phase_adjusted -= time / period;
+        }
+        float waveInput = inverse_weighted_log_linear(
+            v + TAU * twistCos * (phase_adjusted - rot_phase_adjusted / radFreq),
+            1 - twistCos, TAU * twistCos / radFreq / rotRadius) / rotRadius + rot_phase_adjusted;
+        if (abs(twistCos) > 0.01) {
+            waveInput = frac(radFreq * v / twistCos / TAU);
+        } else {
+            waveInput = exp(v) / rotRadius + rotPhase;
+        }
+        float rotWaveInput = (twistSin * r + twistCos) / rotRadius + rot_phase_adjusted;
+        // waveInput = (v / TAU + radPhase) * radFreq;
+        // waveInput = exp(v) / rotRadius + rotPhase;
+
+        float wave = calculateWave(waveInput, waveType);
+        float rotWave = calculateWave(rotWaveInput, waveType);
+
+        float n = max(1.0, abs(radFreq));
+        float BaseRadius = max(originalResolution.x/2, originalResolution.y/2);
+        float Rmax = max(BaseRadius + radAmp, 1e-6);
+        float Rmin = max(BaseRadius - radAmp, 1e-6);
+        float pi_over_n = TAU / 2 / n;
+        float tan_alpha = (Rmax / Rmin - cos(pi_over_n)) / sin(pi_over_n);
+        float alpha = atan(tan_alpha);
+        float term = TAU * (wave + 1.0) / 4.0;
+        
+        float limit_ratio = (1.0 - cos(pi_over_n)) / (1.0 + cos(pi_over_n));
+        float h_limit = BaseRadius * limit_ratio;
+        float straightness = smoothstep(0.0, h_limit, abs(radAmp));
+        straightness = clamp(abs(radAmp) / h_limit, 0.0, 1.0);
+        // straightness = 1;
+
+        float denom_poly = cos(term / n - alpha);
+        float denom_circle = cos(alpha);
+        float denom = lerp(denom_circle, denom_poly, straightness);
+        float newR = Rmax * cos(alpha) / denom;
+        float angleOffset = wave * rotAmp * TAU;
+        
+        float newU = u;
+        newU += (1 - twistSin) * log(BaseRadius/ (Rmax * cos(alpha)) * denom );
+        newU += twistSin * (wave * rotAmp * TAU) + 0 * rotWave * rotAmp * TAU;
+        // newU += calculateWave(radFreq * v / twistCos / TAU, waveType);
+        float2 newP = float2(
+            exp(twistCos * newU + twistSin * v) * cos(-twistSin * newU +twistCos * v),
+            exp(twistCos * newU + twistSin * v) * sin(-twistSin * newU +twistCos * v)
+        );
+        newTexCoord = centerUV + newP / resolution;
+
+        if (debug > 0.5) {
+            float u_comp = (abs(twistSin) > 0.01) ? (u / twistSin) : u;
+            float newu_comp = (abs(twistSin) > 0.01) ? (newU / twistSin) : newU;
+            float v_comp = (abs(twistCos) > 0.01) ? (v / twistCos) : v;
+
+            return float4(
+                1 * frac(v_comp / TAU),
+                0.2 * frac(radFreq * newu_comp / TAU),
+                frac(radFreq * u_comp / TAU),
+                1.0
+            ) * 0.8 + src.Sample(s, newTexCoord) * 0.2;
+        }
+    }
+    
+    if (debug > 0.5) {
+        return float4(frac(theta / TAU), 0.0, wave * 0.5 + 0.5, 1.0);
+    }
+
+    if (newTexCoord.x < 0.0 || newTexCoord.x > 1.0 || 
+        newTexCoord.y < 0.0 || newTexCoord.y > 1.0) 
+    {
+        return float4(0, 0, 0, 0); // 範囲外は透明
+    }
+    return src.Sample(s, newTexCoord);
+}
+
+// x + ln(x) = y を満たす正の x を求める
+float inverse_x_plus_log(float y) {
+    // 初期値: 大きい y では漸近展開、小さめなら単純な近似を使う
+    float x = 0.0;
+    if (y > 8.0) {
+        float logy = log(y);
+        x = y - logy + logy / max(y, 1e-3); // 1次漸近 + 補正
+    } else if (y > 1.0) {
+        x = y - log(y);
+    } else {
+        x = exp(y); // y が小さい（負を含む）領域では x ≈ e^y
+    }
+
+    // 数値安定のために下限を入れる
+    x = max(x, 1e-6);
+
+    // ニュートン法で 3-4 回程度改良（収束が速いので固定回数）
+    [unroll]
+    for (int i = 0; i < 4; ++i) {
+        float f = x + log(x) - y;
+        float fp = 1.0 + 1.0 / x;
+        float dx = f / fp;
+        x -= dx;
+        x = max(x, 1e-6);
+    }
+
+    return x;
+}
+// alpha*ln(x) + beta*x = y を満たす正の x を求める
+float inverse_weighted_log_linear(float y, float alpha, float beta) {
+    if (abs(beta) < 1e-6) {
+        return exp(y / alpha);
+    }
+    if (abs(alpha) < 1e-6) {
+        return y / beta;
+    }
+
+    float V = (y / alpha) - (log(alpha) - log(beta));
+    float w = inverse_x_plus_log(V);
+    return (alpha / beta) * w;
+}
+]]
+
+-- メイン処理
+local function main()
+    local rad_phase_normalized = ((tonumber(PI.radPhase) or radPhase) or 0) / 360
+    
+    local current_rad_amp = tonumber(PI.radAmp) or radAmp
+    
+    if type(PI.center) == "table" then
+        local cx, cy = tonumber(PI.center[1]), tonumber(PI.center[2]);
+        if cx and cy then center = { cx, cy } end
+    end
+    
+    local orig_w, orig_h = obj.getpixel()
+    local expansionSize = math.abs(current_rad_amp)
+    obj.effect("領域拡張", "上", expansionSize, "下", expansionSize, 
+               "右", expansionSize, "左", expansionSize)
+    obj.cx = obj.cx + (expansionSize - expansionSize) * 0.5
+    obj.cy = obj.cy + (expansionSize - expansionSize) * 0.5
+    
+    local w, h = obj.getpixel()
+    
+    local originalCenterX = expansionSize + orig_w * 0.5 + center[1]
+    local originalCenterY = expansionSize + orig_h * 0.5 + center[2]
+
+    local rot_amp_normalized = ((tonumber(PI.rotAmp) or rotAmp) or 0) / 360
+    local rot_phase_normalized = ((tonumber(PI.rotPhase) or rotPhase) or 0) / 360
+
+    local shaderParams = {
+        w, h,
+        orig_w, orig_h,
+        center[1], center[2],
+        originalCenterX, originalCenterY,
+        obj.time,
+        tonumber(PI.period) or period,
+        current_rad_amp,
+        tonumber(PI.radFreq) or radFreq,
+        tonumber(PI.shape) or shape or 1,
+        rad_phase_normalized,
+        tonumber(PI.spiralMix) or spiralMix,
+        rot_amp_normalized,
+        tonumber(PI.rotRadius) or rotRadius,
+        rot_phase_normalized,
+        tonumber(PI.debug) or debug,
+        tonumber(PI.debug_A) or debug_A,
+        tonumber(PI.debug_B) or debug_B,
+    }
+    
+    obj.pixelshader("psmain", "object", {"object"}, shaderParams, "copy")
+end
+
+main()
+
+
+@メッシュ変形
+--information:メッシュ変形@WarpTool_F v0.0.0 by Fu-Majime
+--label:変形\WarpTool_F
+--track@ratio:変形率,0,100,100
+--track@posw:横格子点,2,20,5,1
+--track@posh:縦格子点,2,20,5,1
+--group:詳細設定,false
+--track@div:分割数,1,256,50,1
+--track@smooth:滑らか度,0,100,100
+--value@pos:座標,{}
+--filter
+
+-- RGBA加算合成でα値が1.0を超えた場合に調整するPixelShader
+--[[pixelshader@psmain:
+Texture2D tempbuffer : register(t0);
+float4 psmain(float4 input : SV_Position) : SV_Target {
+	float4 col = tempbuffer[int2(input.xy)];
+	return col.a <= 1.0 ? col : col / col.a;
+}
+]]
+
+-- 標準座標のテーブルを作成
+local init={}
+for y=0,posh-1 do
+	for x=0,posw-1 do
+		table.insert(init,obj.w*(x/(posw-1)-0.5))
+		table.insert(init,obj.h*(y/(posh-1)-0.5))
+	end
+end
+-- 座標の数が異なる場合は標準座標にする
+if (#pos ~= #init) then
+	pos = init
+end
+
+-- アンカーを設定する
+local num = posw*posh
+obj.setanchor("pos",num,init,"small","mesh",posw,posh,"rgba",0xffffff40)
+
+-- 変形率を反映した座標にする
+if (ratio < 100) then
+	for i=1,#pos do
+		pos[i] = init[i] + (pos[i]-init[i])*ratio/100
+	end
+end
+
+-- Catmull-Romスプライン補間（1次元）
+-- t: 0～1 の補間パラメータ, p0,p1,p2,p3: 4つの制御点
+local function catmull_rom(t, p0, p1, p2, p3)
+	local t2 = t * t
+	local t3 = t2 * t
+	return 0.5 * ((2*p1) + (-p0+p2)*t + (2*p0-5*p1+4*p2-p3)*t2 + (-p0+3*p1-3*p2+p3)*t3)
+end
+
+-- 格子点の座標を取得（線形外挿で境界外に対応）
+-- gx: 0～posw-1, gy: 0～posh-1 の格子インデックス
+-- 戻り値: x座標, y座標
+local function grid_get(gx, gy)
+	-- 線形外挿: 境界外は 2*境界点-隣接点 で自然な接線を保つ
+	-- （Catmull-Romの標準的な自然境界条件）
+	if gx < 0 or gx > posw-1 or gy < 0 or gy > posh-1 then
+		local cgx = math.max(0, math.min(posw-1, gx))
+		local cgy = math.max(0, math.min(posh-1, gy))
+		local idx = (cgx + cgy * posw) * 2
+		local bx, by = pos[idx+1], pos[idx+2]
+		-- 隣接する内側の点を求めて外挿
+		local igx = cgx + (gx < 0 and 1 or (gx > posw-1 and -1 or 0))
+		local igy = cgy + (gy < 0 and 1 or (gy > posh-1 and -1 or 0))
+		igx = math.max(0, math.min(posw-1, igx))
+		igy = math.max(0, math.min(posh-1, igy))
+		local iidx = (igx + igy * posw) * 2
+		local nx, ny = pos[iidx+1], pos[iidx+2]
+		return 2*bx - nx, 2*by - ny
+	end
+	local idx = (gx + gy * posw) * 2
+	return pos[idx+1], pos[idx+2]
+end
+
+-- Bicubic Catmull-Romサンプリング
+-- 格子セル(cell_x, cell_y)内の位置(fx, fy) (0～1)での補間座標を返す
+-- smooth_factor: 0=線形, 1=完全Catmull-Rom（呼び出し元でsmooth/100から渡す）
+local function bicubic_sample(cell_x, cell_y, fx, fy, smooth_factor)
+	-- 線形補間（bilinear）の結果
+	local lx0, ly0 = grid_get(cell_x,   cell_y)
+	local lx1, ly1 = grid_get(cell_x+1, cell_y)
+	local lx2, ly2 = grid_get(cell_x+1, cell_y+1)
+	local lx3, ly3 = grid_get(cell_x,   cell_y+1)
+	local top_x  = lx0 + (lx1 - lx0) * fx
+	local top_y  = ly0 + (ly1 - ly0) * fx
+	local bot_x  = lx3 + (lx2 - lx3) * fx
+	local bot_y  = ly3 + (ly2 - ly3) * fx
+	local lin_x  = top_x + (bot_x - top_x) * fy
+	local lin_y  = top_y + (bot_y - top_y) * fy
+
+	if smooth_factor <= 0 then
+		return lin_x, lin_y
+	end
+
+	-- Catmull-Romで行方向に4行分それぞれ補間
+	local row_x = {}
+	local row_y = {}
+	for j = -1, 2 do
+		local gy = cell_y + j
+		local p0x, p0y = grid_get(cell_x-1, gy)
+		local p1x, p1y = grid_get(cell_x,   gy)
+		local p2x, p2y = grid_get(cell_x+1, gy)
+		local p3x, p3y = grid_get(cell_x+2, gy)
+		row_x[j+2] = catmull_rom(fx, p0x, p1x, p2x, p3x)
+		row_y[j+2] = catmull_rom(fx, p0y, p1y, p2y, p3y)
+	end
+	-- 列方向に補間
+	local cr_x = catmull_rom(fy, row_x[1], row_x[2], row_x[3], row_x[4])
+	local cr_y = catmull_rom(fy, row_y[1], row_y[2], row_y[3], row_y[4])
+
+	-- 線形とCatmull-Romをブレンド
+	if smooth_factor >= 1 then
+		return cr_x, cr_y
+	end
+	return lin_x + (cr_x - lin_x) * smooth_factor,
+	       lin_y + (cr_y - lin_y) * smooth_factor
+end
+
+-- 仮想バッファの解像度を決める
+local w,h=obj.getpixel()
+local dstw,dsth=w,h
+local sx=0
+local ex=0
+local sy=0
+local ey=0
+if (obj.getinfo("filter")) then
+	obj.setoption("drawtarget","tempbuffer",dstw,dsth)
+else
+	for i=0,num-1 do
+		sx = math.min(sx,pos[i*2+1])
+		ex = math.max(ex,pos[i*2+1])
+		sy = math.min(sy,pos[i*2+2])
+		ey = math.max(ey,pos[i*2+2])
+	end
+	-- Catmull-Romはオーバーシュートする場合があるのでマージンを追加
+	if (smooth > 0) then
+		local margin_x = (ex - sx) * 0.1 * smooth / 100
+		local margin_y = (ey - sy) * 0.1 * smooth / 100
+		sx = sx - margin_x
+		ex = ex + margin_x
+		sy = sy - margin_y
+		ey = ey + margin_y
+	end
+	dstw = math.ceil(ex-sx)
+	dsth = math.ceil(ey-sy)
+	obj.setoption("drawtarget","tempbuffer",dstw,dsth)
+	sx = (sx+ex)/2
+	sy = (sy+ey)/2
+end
+
+-- 変形させて描画する
+local vertex={}
+local divw = math.ceil(div/posw)
+local divh = math.ceil(div/posh)
+local sf = smooth / 100  -- smooth_factor: 0～1
+for posy=0,posh-2 do
+	for posx=0,posw-2 do
+		-- 各サブ頂点をbicubicサンプリングで算出
+		v1 = h*posy/(posh-1)
+		local prev_row = {}  -- 前の行の頂点座標を保持
+		for xi=0,divw do
+			local fx = xi / divw
+			local bx, by = bicubic_sample(posx, posy, fx, 0, sf)
+			prev_row[xi] = { bx - sx, by - sy }
+		end
+		for yi=1,divh do
+			local fy = yi / divh
+			local curr_row = {}
+			for xi=0,divw do
+				local fx = xi / divw
+				local bx, by = bicubic_sample(posx, posy, fx, fy, sf)
+				curr_row[xi] = { bx - sx, by - sy }
+			end
+			v0 = v1
+			v1 = h*(posy+fy)/(posh-1)
+			u1 = w*posx/(posw-1)
+			for xi=1,divw do
+				local fx = xi / divw
+				u0 = u1
+				u1 = w*(posx+fx)/(posw-1)
+				x0 = prev_row[xi-1][1]
+				y0 = prev_row[xi-1][2]
+				x1 = prev_row[xi][1]
+				y1 = prev_row[xi][2]
+				x2 = curr_row[xi][1]
+				y2 = curr_row[xi][2]
+				x3 = curr_row[xi-1][1]
+				y3 = curr_row[xi-1][2]
+				table.insert(vertex,{x0,y0,0,x1,y1,0,x2,y2,0,x3,y3,0 ,u0,v0,u1,v0,u1,v1,u0,v1})
+			end
+			prev_row = curr_row
+		end
+	end
+end
+obj.setoption("blend","rgba_add")
+obj.drawpoly(vertex);
+
+-- α値を調整してオブジェクトにコピーする
+obj.clearbuffer("object",dstw,dsth)
+obj.pixelshader("psmain","object","tempbuffer")
+obj.cx = obj.cx-sx
+obj.cy = obj.cy-sy
+obj.setoption("focus_mode","fixed_size")
+
+@パペットツール
+--information:パペットツール@WarpTool_F v0.0.0 by Fu-Majime
+--label:変形\WarpTool_F
+--track@ratio:変形率,0,100,100
+--track@pins:ピン数,3,20,3,1
+--track@density:メッシュ密度,5,50,15,1
+--track@div:分割数,1,10,3,1
+--track@stiff:硬さ,0.01,2,1,0.01
+--group:詳細設定,false
+--track@threshold:しきい値,0,255,1,1
+--track@border:縁取り膨張,0,100,0,1
+--check@show:表示,true
+--value@src:ピン元,{}
+--value@dst:ピン先,{}
+
+-- RGBA加算合成でα値が1.0を超えた場合に調整するPixelShader
+--[[pixelshader@psmain:
+Texture2D tempbuffer : register(t0);
+float4 psmain(float4 input : SV_Position) : SV_Target {
+	float4 col = tempbuffer[int2(input.xy)];
+	return col.a <= 1.0 ? col : col / col.a;
+}
+]]
+
+local EPSILON = 1e-10
+obj.effect("領域拡張", "上", 1, "下", 1, 
+        "右", 1, "左", 1)
+local w, h = obj.getpixel()
+local hw, hh = w * 0.5, h * 0.5
+
+-- =============================================================
+-- 1. ピンのデフォルト位置（画像上に均等配置）
+--    ユーザーがドラッグで関節等へ再配置する
+-- =============================================================
+local function make_default_pin_pos(n)
+	local t = {}
+	if n <= 1 then
+		t[1] = 0; t[2] = 0
+	elseif n == 2 then
+		t[1] = -hw * 0.3; t[2] = 0
+		t[3] =  hw * 0.3; t[4] = 0
+	else
+		-- 中央1点 + 残りを楕円上に分散配置
+		t[1] = 0; t[2] = 0
+		local rx = hw * 0.4
+		local ry = hh * 0.4
+		for i = 1, n - 1 do
+			local angle = (i - 1) / (n - 1) * math.pi * 2 - math.pi / 2
+			t[i * 2 + 1] = math.cos(angle) * rx
+			t[i * 2 + 2] = math.sin(angle) * ry
+		end
+	end
+	return t
+end
+
+local default_pins = make_default_pin_pos(pins)
+
+-- ピン数変更時はリセット
+if #src ~= #default_pins then src = default_pins end
+if #dst ~= #default_pins then
+	-- dstのデフォルトはsrcと同じ位置（変形なし）
+	dst = {}
+	for i = 1, #src do dst[i] = src[i] end
+end
+
+-- アンカー設定: 2組のアンカーを表示
+-- src = 変形元（緑系）: ユーザーがキャラの関節等に配置
+-- dst = 変形先（赤系）: ユーザーが変形後の位置に配置
+obj.setanchor("src", pins, default_pins, "small", "rgba", 0x00ff8060)
+obj.setanchor("dst", pins, src, "small", "rgba", 0xff400060)
+
+-- 変形率を反映
+local pin_sx, pin_sy = {}, {}  -- 変形元
+local pin_dx, pin_dy = {}, {}  -- 変形先（ratio反映済み）
+local pin_layer = {}           -- ユーザーが後から整数を足し算してレイヤー調整できるよう用意
+local any_moved = false
+for i = 1, pins do
+	pin_layer[i] = 0
+	pin_sx[i] = src[i * 2 - 1]
+	pin_sy[i] = src[i * 2]
+	if ratio < 100 then
+		pin_dx[i] = src[i * 2 - 1] + (dst[i * 2 - 1] - src[i * 2 - 1]) * ratio / 100
+		pin_dy[i] = src[i * 2]     + (dst[i * 2]     - src[i * 2])     * ratio / 100
+	else
+		pin_dx[i] = dst[i * 2 - 1]
+		pin_dy[i] = dst[i * 2]
+	end
+	if pin_sx[i] ~= pin_dx[i] or pin_sy[i] ~= pin_dy[i] then
+		any_moved = true
+	end
+end
+
+-- =============================================================
+-- ユーティリティ
+-- =============================================================
+local function dist2(ax, ay, bx, by)
+	local dx = ax - bx; local dy = ay - by
+	return dx * dx + dy * dy
+end
+
+local function check_alpha_at(px_x, px_y)
+	local px = math.floor(px_x + hw)
+	local py = math.floor(px_y + hh)
+	px = math.max(0, math.min(w - 1, px))
+	py = math.max(0, math.min(h - 1, py))
+	local _, a = obj.getpixel(px, py, "col")
+	return a * 255 >= threshold
+end
+
+local function get_geodesic_distances(pins, pin_sx, pin_sy, mesh_n_verts, mesh_x, mesh_y, mesh_tris)
+	local adj = {}
+	for i = 1, mesh_n_verts do adj[i] = {} end
+	local function add_edge(u, v, w)
+		adj[u][#adj[u] + 1] = {v = v, w = w}
+	end
+	for i = 1, #mesh_tris do
+		local t = mesh_tris[i]
+		local v1, v2, v3 = t[1], t[2], t[3]
+		local d12 = math.sqrt(dist2(mesh_x[v1], mesh_y[v1], mesh_x[v2], mesh_y[v2]))
+		local d23 = math.sqrt(dist2(mesh_x[v2], mesh_y[v2], mesh_x[v3], mesh_y[v3]))
+		local d31 = math.sqrt(dist2(mesh_x[v3], mesh_y[v3], mesh_x[v1], mesh_y[v1]))
+		add_edge(v1, v2, d12); add_edge(v2, v1, d12)
+		add_edge(v2, v3, d23); add_edge(v3, v2, d23)
+		add_edge(v3, v1, d31); add_edge(v1, v3, d31)
+	end
+	local pin_dist = {}
+	for p = 1, pins do
+		local dist = {}
+		for v = 1, mesh_n_verts do dist[v] = 1e9 end
+		local px, py = pin_sx[p], pin_sy[p]
+		local best_v, best_d = 1, 1e9
+		for v = 1, mesh_n_verts do
+			local d2 = dist2(px, py, mesh_x[v], mesh_y[v])
+			if d2 < best_d then best_d = d2; best_v = v end
+		end
+		dist[best_v] = math.sqrt(best_d)
+		local heap = { {v=best_v, d=dist[best_v]} }
+		local function push(v, d)
+			local i = #heap + 1
+			heap[i] = {v=v, d=d}
+			while i > 1 do
+				local parent = math.floor(i / 2)
+				if heap[parent].d <= heap[i].d then break end
+				heap[parent], heap[i] = heap[i], heap[parent]
+				i = parent
+			end
+		end
+		local function pop()
+			if #heap == 0 then return nil end
+			local res = heap[1]
+			heap[1] = heap[#heap]
+			table.remove(heap)
+			local i = 1
+			local n = #heap
+			while i * 2 <= n do
+				local c = i * 2
+				if c + 1 <= n and heap[c+1].d < heap[c].d then c = c + 1 end
+				if heap[i].d <= heap[c].d then break end
+				heap[i], heap[c] = heap[c], heap[i]
+				i = c
+			end
+			return res.v, res.d
+		end
+		
+		local visited = {}
+		while true do
+			local u, d = pop()
+			if not u then break end
+			if not visited[u] then
+				visited[u] = true
+				for _, e in ipairs(adj[u]) do
+					local v, weight = e.v, e.w
+					if not visited[v] then
+						local nd = d + weight
+						if nd < dist[v] then
+							dist[v] = nd
+							push(v, nd)
+						end
+					end
+				end
+			end
+		end
+		pin_dist[p] = dist
+	end
+	return pin_dist
+end
+
+-- =============================================================
+-- 2. メッシュ生成
+-- =============================================================
+-- mesh_x[], mesh_y[] = 全頂点座標
+-- mesh_tris[] = {{ i1, i2, i3 }, ...}  (1-based index into mesh_x/y)
+local mesh_x, mesh_y = {}, {}
+local mesh_tris = {}
+local mesh_n_verts = 0
+
+-- DLL呼び出し
+local ffi_ok, ffi = pcall(require, "ffi")
+if ffi_ok then
+    pcall(function()
+        ffi.cdef[[
+            typedef struct {
+                float* vertices;
+                uint32_t vertex_count;
+                uint32_t* indices;
+                uint32_t index_count;
+            } MeshResult;
+            MeshResult* puppet_mesh_generate(
+                const uint8_t* data, int32_t w, int32_t h,
+                int32_t threshold, int32_t density, int32_t border_px);
+            void puppet_mesh_free(MeshResult* result);
+        ]]
+    end)
+    pcall(require, "puppet_mesh")
+    dll_ok, dll = pcall(ffi.load, "puppet_mesh")
+    debug_print("dll_ok: " .. tostring(dll_ok))
+    if dll_ok then
+        puppet_mesh_dll = dll
+        puppet_mesh_ffi = ffi
+    end
+end
+
+if puppet_mesh_dll then
+    -- DLLでメッシュ生成
+    local data, pw, ph = obj.getpixeldata("object", "rgba")
+    local result = puppet_mesh_dll.puppet_mesh_generate(
+        puppet_mesh_ffi.cast("const uint8_t*", data),
+        pw, ph, threshold, density, border)
+
+    if result ~= nil and result.vertex_count >= 3 and result.index_count >= 3 then
+        mesh_n_verts = result.vertex_count
+        for i = 0, mesh_n_verts - 1 do
+            mesh_x[i + 1] = result.vertices[i * 2]
+            mesh_y[i + 1] = result.vertices[i * 2 + 1]
+        end
+        local tri_count = math.floor(result.index_count / 3)
+        for i = 0, tri_count - 1 do
+            mesh_tris[i + 1] = {
+                result.indices[i * 3] + 1,
+                result.indices[i * 3 + 1] + 1,
+                result.indices[i * 3 + 2] + 1
+            }
+        end
+        puppet_mesh_dll.puppet_mesh_free(result)
+    else
+        if result ~= nil then
+            puppet_mesh_dll.puppet_mesh_free(result)
+        end
+        -- フォールバック: 四隅
+        mesh_n_verts = 4
+        mesh_x = { -hw, hw, hw, -hw }
+        mesh_y = { -hh, -hh, hh, hh }
+        mesh_tris = { { 1, 2, 3 }, { 1, 3, 4 } }
+    end
+else
+    -- DLLが無い場合のフォールバック: 格子点の座標を取得
+    local cell_size = math.max(w, h) / density
+    local cols = math.ceil(w / cell_size)
+    local rows = math.ceil(h / cell_size)
+    local cw = w / cols
+    local ch = h / rows
+
+    mesh_n_verts = (rows + 1) * (cols + 1)
+    for iy = 0, rows do
+        for ix = 0, cols do
+            local idx = iy * (cols + 1) + ix + 1
+            mesh_x[idx] = ix * cw - hw
+            mesh_y[idx] = iy * ch - hh
+        end
+    end
+
+    local function grid_idx(ix, iy)
+        return iy * (cols + 1) + ix + 1
+    end
+
+    for iy = 0, rows - 1 do
+        for ix = 0, cols - 1 do
+            local i0 = grid_idx(ix,     iy)
+            local i1 = grid_idx(ix + 1, iy)
+            local i2 = grid_idx(ix + 1, iy + 1)
+            local i3 = grid_idx(ix,     iy + 1)
+
+            if check_alpha_at((mesh_x[i0]+mesh_x[i1]+mesh_x[i2])/3, (mesh_y[i0]+mesh_y[i1]+mesh_y[i2])/3) or
+                check_alpha_at(mesh_x[i0], mesh_y[i0]) or
+                check_alpha_at(mesh_x[i1], mesh_y[i1]) or
+                check_alpha_at(mesh_x[i2], mesh_y[i2]) then
+                table.insert(mesh_tris, { i0, i1, i2 })
+            end
+            if check_alpha_at((mesh_x[i0]+mesh_x[i2]+mesh_x[i3])/3, (mesh_y[i0]+mesh_y[i2]+mesh_y[i3])/3) or
+                check_alpha_at(mesh_x[i0], mesh_y[i0]) or
+                check_alpha_at(mesh_x[i2], mesh_y[i2]) or
+                check_alpha_at(mesh_x[i3], mesh_y[i3]) then
+                table.insert(mesh_tris, { i0, i2, i3 })
+            end
+        end
+    end
+end
+
+local pin_dist = get_geodesic_distances(pins, pin_sx, pin_sy, mesh_n_verts, mesh_x, mesh_y, mesh_tris)
+
+-- =============================================================
+-- 3. MLS Rigid変形
+-- =============================================================
+local alpha_exp = stiff
+
+local function mls_rigid(vx, vy, dists)
+	if not any_moved then return vx, vy, 0 end
+
+	local weights = {}
+	local w_sum = 0
+	local snap_idx = 0
+
+	for i = 1, pins do
+		local d = dists[i]
+		if d < 1e-5 then
+			snap_idx = i; break
+		end
+		local wi = 1.0 / math.pow(d, 2 * alpha_exp)
+		weights[i] = wi
+		w_sum = w_sum + wi
+	end
+
+	local layer_offset = 0
+	if snap_idx > 0 then
+		layer_offset = pin_layer[snap_idx]
+		return pin_dx[snap_idx], pin_dy[snap_idx], layer_offset
+	end
+	if w_sum < EPSILON then return vx, vy, 0 end
+
+	local psx, psy, qsx, qsy = 0, 0, 0, 0
+	for i = 1, pins do
+		local wi = weights[i]
+		psx = psx + wi * pin_sx[i]; psy = psy + wi * pin_sy[i]
+		qsx = qsx + wi * pin_dx[i]; qsy = qsy + wi * pin_dy[i]
+		layer_offset = layer_offset + wi * pin_layer[i]
+	end
+	psx = psx / w_sum; psy = psy / w_sum
+	qsx = qsx / w_sum; qsy = qsy / w_sum
+	layer_offset = layer_offset / w_sum
+
+	local vpx, vpy = vx - psx, vy - psy
+	local M11, M12 = 0, 0
+	for i = 1, pins do
+		local wi = weights[i]
+		local phx, phy = pin_sx[i] - psx, pin_sy[i] - psy
+		local qhx, qhy = pin_dx[i] - qsx, pin_dy[i] - qsy
+		M11 = M11 + wi * (qhx * phx + qhy * phy)
+		M12 = M12 + wi * (qhx * (-phy) + qhy * phx)
+	end
+
+	local len = math.sqrt(M11 * M11 + M12 * M12)
+	if len < EPSILON then return vx, vy, layer_offset end
+	local cos_r, sin_r = M11 / len, M12 / len
+
+	return (vpx * cos_r - vpy * sin_r) + qsx,
+	       (vpx * sin_r + vpy * cos_r) + qsy,
+	       layer_offset
+end
+
+-- =============================================================
+-- 4. 全頂点の変形座標を計算
+-- =============================================================
+local def_x, def_y, def_layer = {}, {}, {}
+for i = 1, mesh_n_verts do
+	local dists = {}
+	for p = 1, pins do dists[p] = pin_dist[p][i] end
+	local dx, dy, loff = mls_rigid(mesh_x[i], mesh_y[i], dists)
+	def_x[i], def_y[i] = dx, dy
+	def_layer[i] = (mesh_y[i] + hh) / h + loff
+end
+
+-- =============================================================
+-- 5. 描画バッファ設定
+-- =============================================================
+local dstw, dsth = w, h
+local sx_off, sy_off = 0, 0
+
+if obj.getinfo("filter") then
+	obj.setoption("drawtarget", "tempbuffer", dstw, dsth)
+else
+	local minbx, minby = 1e9, 1e9
+	local maxbx, maxby = -1e9, -1e9
+	for i = 1, mesh_n_verts do
+		if def_x[i] and def_x[i] < minbx then minbx = def_x[i] end
+		if def_x[i] and def_x[i] > maxbx then maxbx = def_x[i] end
+		if def_y[i] and def_y[i] < minby then minby = def_y[i] end
+		if def_y[i] and def_y[i] > maxby then maxby = def_y[i] end
+	end
+	if minbx > maxbx then minbx = -hw; maxbx = hw end
+	if minby > maxby then minby = -hh; maxby = hh end
+	local mx = (maxbx - minbx) * 0.1
+	local my = (maxby - minby) * 0.1
+	minbx = minbx - mx; maxbx = maxbx + mx
+	minby = minby - my; maxby = maxby + my
+	dstw = math.max(1, math.ceil(maxbx - minbx))
+	dsth = math.max(1, math.ceil(maxby - minby))
+	obj.setoption("drawtarget", "tempbuffer", dstw, dsth)
+	sx_off = (minbx + maxbx) / 2
+	sy_off = (minby + maxby) / 2
+end
+
+-- =============================================================
+-- 6. 三角形サブ分割 + 滑らか描画
+-- =============================================================
+local all_sub_tris = {}
+local d = div
+
+for ti = 1, #mesh_tris do
+	local tri = mesh_tris[ti]
+	local i1, i2, i3 = tri[1], tri[2], tri[3]
+
+	-- メッシュ頂点の初期位置（UV計算用）
+	local ox1, oy1 = mesh_x[i1], mesh_y[i1]
+	local ox2, oy2 = mesh_x[i2], mesh_y[i2]
+	local ox3, oy3 = mesh_x[i3], mesh_y[i3]
+
+	if d <= 1 then
+		-- 分割なし: 頂点のMLS結果をそのまま使用
+		local avg_layer = (def_layer[i1] + def_layer[i2] + def_layer[i3]) / 3
+		local p0 = { def_x[i1] - sx_off, def_y[i1] - sy_off, 0, (ox1 + hw) / w, (oy1 + hh) / h }
+		local p1 = { def_x[i2] - sx_off, def_y[i2] - sy_off, 0, (ox2 + hw) / w, (oy2 + hh) / h }
+		local p2 = { def_x[i3] - sx_off, def_y[i3] - sy_off, 0, (ox3 + hw) / w, (oy3 + hh) / h }
+		table.insert(all_sub_tris, { p0 = p0, p1 = p1, p2 = p2, layer = avg_layer })
+	else
+		-- バリセントリック座標でサブ頂点を生成
+		-- sp[row][col] = { deformed_x, deformed_y, 0, u, v, layer }
+		-- row=0..d, col=0..d-row
+		local sp = {}
+		for row = 0, d do
+			sp[row] = {}
+			for col = 0, d - row do
+				local bu = col / d
+				local bv = row / d
+				local bw = 1 - bu - bv
+
+				-- 初期位置での補間（UV用 + MLS入力）
+				local ipx = bw * ox1 + bu * ox2 + bv * ox3
+				local ipy = bw * oy1 + bu * oy2 + bv * oy3
+
+				-- サブ頂点ごとにMLS Rigidを評価（滑らかな変形）
+				local dists = {}
+				for p = 1, pins do
+					dists[p] = bw * pin_dist[p][i1] + bu * pin_dist[p][i2] + bv * pin_dist[p][i3]
+				end
+				local dpx, dpy, loff = mls_rigid(ipx, ipy, dists)
+				local blayer = (ipy + hh) / h
+
+				sp[row][col] = {
+					dpx - sx_off, dpy - sy_off, 0,
+					(ipx + hw) / w, (ipy + hh) / h,
+					blayer + loff
+				}
+			end
+		end
+
+		-- サブ三角形を生成
+		for row = 0, d - 1 do
+			for col = 0, d - 1 - row do
+				local p0 = sp[row][col]
+				local p1 = sp[row][col + 1]
+				local p2 = sp[row + 1][col]
+
+				local l_up = (p0[6] + p1[6] + p2[6]) / 3
+				table.insert(all_sub_tris, { p0=p0, p1=p1, p2=p2, layer=l_up })
+
+				if col + 1 <= d - 1 - row then
+					local p3 = sp[row + 1][col + 1]
+					local l_dn = (p1[6] + p3[6] + p2[6]) / 3
+					table.insert(all_sub_tris, { p0=p1, p1=p3, p2=p2, layer=l_dn })
+				end
+			end
+		end
+	end
+end
+
+-- レイヤー順（Zオーダー）でサブ三角形をソート
+table.sort(all_sub_tris, function(a, b) return a.layer < b.layer end)
+
+local flat_vtx = {}
+for i = 1, #all_sub_tris do
+	local t = all_sub_tris[i]
+	table.insert(flat_vtx, { t.p0[1], t.p0[2], 0, t.p0[4], t.p0[5] })
+	table.insert(flat_vtx, { t.p1[1], t.p1[2], 0, t.p1[4], t.p1[5] })
+	table.insert(flat_vtx, { t.p2[1], t.p2[2], 0, t.p2[4], t.p2[5] })
+end
+
+if #flat_vtx >= 3 then
+	obj.setoption("blend", "alpha_add")
+	obj.drawpoly(flat_vtx, 3)
+end
+
+-- =============================================================
+-- 7. 可視化（show=true）
+-- =============================================================
+if show and obj.getoption("gui") then
+	-- ワイヤーフレーム
+	local wire = {}
+	local lw = 0.8
+	local ca = 0.35
+	local cr, cg, cb = 0.0, 0.8 * ca, 1.0 * ca
+
+	for ti = 1, #mesh_tris do
+		local tri = mesh_tris[ti]
+		local vx = {
+			def_x[tri[1]] - sx_off, def_y[tri[1]] - sy_off,
+			def_x[tri[2]] - sx_off, def_y[tri[2]] - sy_off,
+			def_x[tri[3]] - sx_off, def_y[tri[3]] - sy_off
+		}
+		for e = 0, 2 do
+			local ax, ay = vx[e * 2 + 1], vx[e * 2 + 2]
+			local ne = ((e + 1) % 3)
+			local bx, by = vx[ne * 2 + 1], vx[ne * 2 + 2]
+			local edx, edy = bx - ax, by - ay
+			local elen = math.sqrt(edx * edx + edy * edy)
+			if elen > 0.1 then
+				local nx = -edy / elen * lw
+				local ny =  edx / elen * lw
+				table.insert(wire, { ax + nx, ay + ny, 0, cr, cg, cb, ca })
+				table.insert(wire, { bx + nx, by + ny, 0, cr, cg, cb, ca })
+				table.insert(wire, { bx - nx, by - ny, 0, cr, cg, cb, ca })
+				table.insert(wire, { ax - nx, ay - ny, 0, cr, cg, cb, ca })
+			end
+		end
+	end
+
+	if #wire >= 4 then
+		obj.setoption("blend", "alpha_add")
+		obj.drawpoly(wire)
+	end
+
+	-- ピンの線と矢印: 常にsrc→dstの全経路を表示
+	-- 緑の線 = src→dst(full)の経路、赤の矢印 = src→現在位置(ratio反映)
+	for i = 1, pins do
+		local ox = pin_sx[i] - sx_off  -- src位置
+		local oy = pin_sy[i] - sy_off
+		local fx = dst[i * 2 - 1] - sx_off  -- dst(full)位置
+		local fy = dst[i * 2]     - sy_off
+		local cx = pin_dx[i] - sx_off  -- 現在位置(ratio反映)
+		local cy = pin_dy[i] - sy_off
+
+		-- 緑の線: src→dst(full) — 常に全経路を表示
+		local fdx, fdy = fx - ox, fy - oy
+		local flen = math.sqrt(fdx * fdx + fdy * fdy)
+		if flen > 1 then
+			local ga = 0.45
+			local gr, gg, gb = 0.1 * ga, 0.9 * ga, 0.2 * ga
+			local gnx = -fdy / flen * 1.0
+			local gny =  fdx / flen * 1.0
+			obj.drawpoly({
+				{ ox + gnx, oy + gny, 0, gr, gg, gb, ga },
+				{ fx + gnx, fy + gny, 0, gr, gg, gb, ga },
+				{ fx - gnx, fy - gny, 0, gr, gg, gb, ga },
+				{ ox - gnx, oy - gny, 0, gr, gg, gb, ga }
+			})
+		end
+
+		-- 赤の矢印: src→現在位置(ratio反映)
+		local adx, ady = cx - ox, cy - oy
+		local alen = math.sqrt(adx * adx + ady * ady)
+		if alen > 2 then
+			local aa = 0.7
+			local ar, ag, ab = 1.0 * aa, 0.3 * aa, 0.1 * aa
+			local anx = -ady / alen * 1.5
+			local any =  adx / alen * 1.5
+			obj.drawpoly({
+				{ ox + anx, oy + any, 0, ar, ag, ab, aa },
+				{ cx + anx, cy + any, 0, ar, ag, ab, aa },
+				{ cx - anx, cy - any, 0, ar, ag, ab, aa },
+				{ ox - anx, oy - any, 0, ar, ag, ab, aa }
+			})
+			-- 矢印先端
+			local hlen = math.min(8, alen * 0.3)
+			local hw_a = hlen * 0.6
+			local hx, hy = adx / alen, ady / alen
+			local bax, bay = cx - hx * hlen, cy - hy * hlen
+			obj.drawpoly({
+				{ cx, cy, 0, ar, ag, ab, aa },
+				{ bax + (-hy) * hw_a, bay + hx * hw_a, 0, ar, ag, ab, aa },
+				{ bax - (-hy) * hw_a, bay - hx * hw_a, 0, ar, ag, ab, aa }
+			}, 3)
+		end
+	end
+end
+
+-- =============================================================
+-- 8. バッファ処理
+-- =============================================================
+obj.clearbuffer("object", dstw, dsth)
+obj.pixelshader("psmain", "object", "tempbuffer")
+obj.cx = obj.cx - sx_off
+obj.cy = obj.cy - sy_off
+obj.setoption("focus_mode", "fixed_size")

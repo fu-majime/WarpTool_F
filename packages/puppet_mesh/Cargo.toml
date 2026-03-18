@@ -1,0 +1,12 @@
+[package]
+name = "puppet_mesh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+name = "puppet_mesh"
+crate-type = ["cdylib"]
+
+[dependencies]
