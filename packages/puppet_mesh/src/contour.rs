@@ -1,7 +1,10 @@
-/// Marching Squares 輪郭抽出
-///
-/// α画像からしきい値に基づいて等値線(輪郭)を抽出する。
-/// 結果は連結された輪郭ループのリストとして返される。
+//! Marching Squares 輪郭抽出
+//!
+//! α画像からしきい値に基づいて等値線(輪郭)を抽出する。
+//! 結果は連結された輪郭ループのリストとして返される。
+
+type Point = (f32, f32);
+type Segment = (Point, Point);
 
 /// α値の2Dグリッド上でMarching Squaresを実行し、輪郭ループを抽出する。
 ///
@@ -11,19 +14,17 @@
 /// - `dilate`: 輪郭を外側に拡張するピクセル数
 ///
 /// 戻り値: 輪郭ループのリスト。各ループは (x, y) 座標の列（画像中心原点）。
+#[cfg(test)]
 pub fn extract_contours(
     alpha: &[u8],
     w: usize,
     h: usize,
     threshold: u8,
     dilate: f32,
-) -> Vec<Vec<(f32, f32)>> {
+) -> Vec<Vec<Point>> {
     if w < 2 || h < 2 {
         return Vec::new();
     }
-
-    let hw = w as f32 * 0.5;
-    let hh = h as f32 * 0.5;
 
     // 二値化マップ: true = 不透明領域
     let mut binary = vec![false; w * h];
@@ -68,11 +69,7 @@ pub fn extract_contours(
 
 /// 事前に二値化済みのマップから Marching Squares で輪郭を抽出する。
 /// EDT膨張との組み合わせで使用。
-pub fn extract_contours_from_binary(
-    binary: &[bool],
-    w: usize,
-    h: usize,
-) -> Vec<Vec<(f32, f32)>> {
+pub fn extract_contours_from_binary(binary: &[bool], w: usize, h: usize) -> Vec<Vec<Point>> {
     if w < 2 || h < 2 {
         return Vec::new();
     }
@@ -80,14 +77,14 @@ pub fn extract_contours_from_binary(
 }
 
 /// Marching Squares 実行（内部関数）
-fn marching_squares(binary: &[bool], w: usize, h: usize) -> Vec<Vec<(f32, f32)>> {
+fn marching_squares(binary: &[bool], w: usize, h: usize) -> Vec<Vec<Point>> {
     let hw = w as f32 * 0.5;
     let hh = h as f32 * 0.5;
 
     // Marching Squares: セル(x, y)の4隅の状態から等値線セグメントを抽出
     // セルは (w-1)×(h-1) 個
     // 各セグメントは (x0,y0) → (x1,y1) のエッジ
-    let mut segments: Vec<((f32, f32), (f32, f32))> = Vec::new();
+    let mut segments: Vec<Segment> = Vec::new();
 
     for cy in 0..(h - 1) {
         for cx in 0..(w - 1) {
@@ -140,17 +137,12 @@ fn marching_squares(binary: &[bool], w: usize, h: usize) -> Vec<Vec<(f32, f32)>>
     }
 
     // セグメントを連結して輪郭ループにする
-    let contours = chain_segments(&segments, hw, hh);
-    contours
+    chain_segments(&segments, hw, hh)
 }
 
 /// セグメントリストを連結してループ（または開いた輪郭線）にする。
 /// 座標は画像中心原点に変換される。
-fn chain_segments(
-    segments: &[((f32, f32), (f32, f32))],
-    hw: f32,
-    hh: f32,
-) -> Vec<Vec<(f32, f32)>> {
+fn chain_segments(segments: &[Segment], hw: f32, hh: f32) -> Vec<Vec<Point>> {
     let n = segments.len();
     if n == 0 {
         return Vec::new();
@@ -161,15 +153,14 @@ fn chain_segments(
 
     // 終点→セグメントインデックスのマルチマップ
     // 近接点をスナップするために量子化キーを使う
-    let quantize = |x: f32, y: f32| -> (i32, i32) {
-        ((x * 4.0).round() as i32, (y * 4.0).round() as i32)
-    };
+    let quantize =
+        |x: f32, y: f32| -> (i32, i32) { ((x * 4.0).round() as i32, (y * 4.0).round() as i32) };
 
     // 始点から探索可能なセグメントのインデックスマップ
     let mut start_map: std::collections::HashMap<(i32, i32), Vec<usize>> =
         std::collections::HashMap::new();
     for (i, seg) in segments.iter().enumerate() {
-        let key = quantize(seg.0 .0, seg.0 .1);
+        let key = quantize(seg.0.0, seg.0.1);
         start_map.entry(key).or_default().push(i);
     }
 
@@ -180,8 +171,8 @@ fn chain_segments(
         used[seed] = true;
 
         let mut chain: Vec<(f32, f32)> = Vec::new();
-        chain.push((segments[seed].0 .0 - hw, segments[seed].0 .1 - hh));
-        chain.push((segments[seed].1 .0 - hw, segments[seed].1 .1 - hh));
+        chain.push((segments[seed].0.0 - hw, segments[seed].0.1 - hh));
+        chain.push((segments[seed].1.0 - hw, segments[seed].1.1 - hh));
 
         // 末尾から連結
         loop {
@@ -192,7 +183,7 @@ fn chain_segments(
                 for &idx in indices {
                     if !used[idx] {
                         used[idx] = true;
-                        chain.push((segments[idx].1 .0 - hw, segments[idx].1 .1 - hh));
+                        chain.push((segments[idx].1.0 - hw, segments[idx].1.1 - hh));
                         found = true;
                         break;
                     }

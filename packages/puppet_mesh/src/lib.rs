@@ -1,7 +1,21 @@
-/// puppet_mesh — 輪郭ベースメッシュ生成 DLL
-///
-/// AviUtl2 LuaJIT FFI から呼び出されるC互換FFIエクスポート関数を提供する。
-/// RGBA画像データからα境界に基づいた高品質メッシュを生成する。
+//! AviUtl2 script module for contour-based puppet meshes.
+//!
+//! The module accepts the data pointer returned by `obj.getpixeldata()` and
+//! returns ordinary Lua arrays. No allocator-owned Rust memory crosses the
+//! plugin boundary.
+
+use std::{
+    ffi::CString,
+    panic::{AssertUnwindSafe, catch_unwind},
+    ptr::NonNull,
+};
+
+use aviutl2::{
+    AnyResult,
+    anyhow::{self, Context as _},
+    module::{ModuleFunction, ParamType, ScriptModuleCallHandle, ScriptModuleFunctions},
+    sys::module2::SCRIPT_MODULE_PARAM,
+};
 
 mod contour;
 mod delaunay;
@@ -9,246 +23,290 @@ mod dilate;
 mod poisson;
 mod simplify;
 
-/// FFIで返却されるメッシュ結果。
-/// LuaJIT の ffi.cdef で同じレイアウトを定義する。
-#[repr(C)]
-pub struct MeshResult {
-    /// 頂点座標配列 [x0, y0, x1, y1, ...] (画像中心原点, f32)
-    pub vertices: *mut f32,
-    /// 頂点数 (座標配列の要素数は vertex_count * 2)
-    pub vertex_count: u32,
-    /// 三角形インデックス配列 [i0, i1, i2, ...] (0-based, u32)
-    pub indices: *mut u32,
-    /// インデックス数 (三角形数 = index_count / 3)
-    pub index_count: u32,
+const RGBA_CHANNELS: usize = 4;
+const MIN_DENSITY: i32 = 5;
+const MAX_DENSITY: i32 = 200;
+
+#[aviutl2::plugin(ScriptModule)]
+struct PuppetMeshModule;
+
+impl aviutl2::module::ScriptModule for PuppetMeshModule {
+    fn new(_info: aviutl2::AviUtl2Info) -> AnyResult<Self> {
+        Ok(Self)
+    }
+
+    fn plugin_info(&self) -> aviutl2::module::ScriptModuleTable {
+        aviutl2::module::ScriptModuleTable {
+            information: format!(
+                "Puppet mesh generator for AviUtl2 / v{} / Fu-Majime",
+                env!("CARGO_PKG_VERSION")
+            ),
+            functions: Self::functions(),
+        }
+    }
 }
 
-/// メッシュを生成する。
-///
-/// # パラメータ
-/// - `data`: RGBA画像データへのポインタ (各ピクセル4バイト: R,G,B,A)
-/// - `w`, `h`: 画像サイズ（ピクセル）
-/// - `threshold`: αしきい値 (0-255)
-/// - `density`: メッシュ密度 (5-50, 大きいほど細かい)
-/// - `border_px`: 縁取り膨張ピクセル数 (0=膨張なし)
-///
-/// # 戻り値
-/// ヒープ上に確保された MeshResult へのポインタ。
-/// 使用後は `puppet_mesh_free()` で解放すること。
-#[no_mangle]
-pub extern "C" fn puppet_mesh_generate(
-    data: *const u8,
-    w: i32,
-    h: i32,
-    threshold: i32,
-    density: i32,
-    border_px: i32,
-) -> *mut MeshResult {
-    let result = std::panic::catch_unwind(|| {
-        generate_impl(data, w, h, threshold, density, border_px)
-    });
+impl ScriptModuleFunctions for PuppetMeshModule {
+    fn functions() -> Vec<ModuleFunction> {
+        vec![ModuleFunction {
+            name: "generate".to_owned(),
+            func: generate_callback,
+        }]
+    }
+}
+
+aviutl2::register_script_module!(PuppetMeshModule);
+
+/// AviUtl2 exposes the value returned by `obj.getpixeldata()` as Lua
+/// `Userdata`. aviutl2-rs 0.42's typed pointer conversion only accepts
+/// `LightUserdata`, so this one callback deliberately reads the pointer through
+/// the SDK's raw `get_param_data` entry point. All other arguments and results
+/// still use the checked high-level wrapper.
+extern "C" fn generate_callback(raw: *mut SCRIPT_MODULE_PARAM) {
+    let result = catch_unwind(AssertUnwindSafe(|| generate_callback_inner(raw)));
 
     match result {
-        Ok(r) => r,
-        Err(_) => {
-            // パニック時は空の結果を返す
-            Box::into_raw(Box::new(MeshResult {
-                vertices: std::ptr::null_mut(),
-                vertex_count: 0,
-                indices: std::ptr::null_mut(),
-                index_count: 0,
-            }))
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => set_callback_error(raw, &error.to_string()),
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("unknown panic");
+            set_callback_error(raw, &format!("internal panic: {message}"));
         }
     }
 }
 
-fn generate_impl(
-    data: *const u8,
-    w: i32,
-    h: i32,
+fn generate_callback_inner(raw: *mut SCRIPT_MODULE_PARAM) -> AnyResult<()> {
+    anyhow::ensure!(!raw.is_null(), "AviUtl2 passed a null module-call handle");
+
+    // SAFETY: AviUtl2 owns `raw` and guarantees that it remains valid for the
+    // duration of this synchronous module callback.
+    let mut params = unsafe { ScriptModuleCallHandle::from_raw(raw) };
+    let data_type = params.get_param_type(0);
+    anyhow::ensure!(
+        matches!(
+            data_type,
+            Some(ParamType::Userdata | ParamType::LightUserdata)
+        ),
+        "parameter #0 must be pixel data (Userdata), got {data_type:?}"
+    );
+
+    // SAFETY: `raw` was checked above and points to a valid SDK parameter
+    // table. Unlike aviutl2-rs 0.42's wrapper, the SDK function supports the
+    // full Userdata value returned by `obj.getpixeldata()`.
+    let data = unsafe { ((*raw).get_param_data)(0) };
+    let data = NonNull::new(data.cast::<u8>()).context("pixel data pointer is null")?;
+
+    let width = params.get_param_int(1).context("invalid width parameter")?;
+    let height = params
+        .get_param_int(2)
+        .context("invalid height parameter")?;
+    let threshold = params
+        .get_param_int(3)
+        .context("invalid threshold parameter")?;
+    let density = params
+        .get_param_int(4)
+        .context("invalid density parameter")?;
+    let border_px = params
+        .get_param_int(5)
+        .context("invalid border parameter")?;
+
+    let (vertices, indices) =
+        generate_from_pixel_data(data, width, height, threshold, density, border_px)?;
+    params
+        .push_result_array_float(&vertices)
+        .context("failed to return mesh vertices")?;
+    params
+        .push_result_array_int(&indices)
+        .context("failed to return mesh indices")?;
+    Ok(())
+}
+
+fn set_callback_error(raw: *mut SCRIPT_MODULE_PARAM, message: &str) {
+    if raw.is_null() {
+        return;
+    }
+
+    // CString cannot contain embedded NULs. Replacing them still gives the Lua
+    // caller a useful error instead of panicking while reporting an error.
+    let message = message.replace('\0', "\\0");
+    if let Ok(message) = CString::new(message) {
+        // SAFETY: This is only called synchronously from the host callback, so
+        // the SDK table and the temporary C string are both valid for the call.
+        unsafe { ((*raw).set_error)(message.as_ptr()) };
+    }
+}
+
+fn generate_from_pixel_data(
+    data: NonNull<u8>,
+    width: i32,
+    height: i32,
     threshold: i32,
     density: i32,
     border_px: i32,
-) -> *mut MeshResult {
-    if data.is_null() || w <= 0 || h <= 0 {
-        return Box::into_raw(Box::new(MeshResult {
-            vertices: std::ptr::null_mut(),
-            vertex_count: 0,
-            indices: std::ptr::null_mut(),
-            index_count: 0,
-        }));
+) -> AnyResult<(Vec<f64>, Vec<i32>)> {
+    let (width, height, byte_len) = checked_image_layout(width, height)?;
+
+    // SAFETY: AviUtl2 owns this buffer. `obj.getpixeldata()` returns a pointer
+    // to width * height RGBA32 pixels, and Lua passes that pointer and the same
+    // dimensions in this synchronous call. The slice is never retained.
+    let rgba = unsafe { std::slice::from_raw_parts(data.as_ptr(), byte_len) };
+    let mesh = generate_mesh(rgba, width, height, threshold, density, border_px)?;
+
+    let mut vertices = Vec::with_capacity(mesh.points.len() * 2);
+    for (x, y) in mesh.points {
+        vertices.push(f64::from(x));
+        vertices.push(f64::from(y));
     }
 
-    let w = w as usize;
-    let h = h as usize;
-    let threshold = threshold.clamp(0, 255) as u8;
-    let density = density.clamp(5, 200) as usize;
-    let border = border_px.max(0) as f32;
-
-    // メッシュ間隔と誤差許容値の計算
-    let max_dim = w.max(h) as f32;
-    let min_spacing = max_dim / density as f32;
-    // Douglas-Peuckerの許容誤差
-    let epsilon = min_spacing * 0.4;
-
-    // DPで内側に食い込む最大量が epsilon なので、
-    // 事前に border + epsilon だけ膨張させることで、
-    // 単純化後のメッシュ辺が不透明領域を絶対に切り取らないようにする。
-    let total_dilate = border + epsilon;
-
-    // 画像の境界に接するオブジェクトも正しく輪郭 추출・膨張できるようにパディングする
-    let pad = (total_dilate.ceil() as usize) + 2;
-    let padded_w = w + 2 * pad;
-    let padded_h = h + 2 * pad;
-
-    // RGBA画像からα値を抽出し、パディングされた二値マップを作成
-    let rgba = unsafe { std::slice::from_raw_parts(data, w * h * 4) };
-    let mut binary = vec![false; padded_w * padded_h];
-    for y in 0..h {
-        let src_row_start = y * w * 4;
-        let dst_row_start = (y + pad) * padded_w + pad;
-        for x in 0..w {
-            let a = rgba[src_row_start + x * 4 + 3];
-            binary[dst_row_start + x] = a >= threshold;
+    let mut indices = Vec::with_capacity(mesh.triangles.len() * 3);
+    for triangle in mesh.triangles {
+        for index in triangle {
+            indices.push(i32::try_from(index).context("mesh has too many vertices for AviUtl2")?);
         }
     }
 
-    // EDT膨張
-    if total_dilate > 0.0 {
-        dilate::dilate_edt(&mut binary, padded_w, padded_h, total_dilate);
-    }
-
-    // 膨張後のパディング済みα画像（Delaunayの三角形カリング・Poisson用）
-    let dilated_alpha: Vec<u8> = binary.iter().map(|&b| if b { 255 } else { 0 }).collect();
-
-    // 1. 輪郭抽出 (Marching Squares, パディングされたマップから)
-    // 座標はパディング済みグリッドの中心が原点になるが、左右上下対称にパディング
-    // しているため、元の画像の中心と物理的に全く同じ位置になる！そのまま処理可能。
-    let contour_loops = contour::extract_contours_from_binary(&binary, padded_w, padded_h);
-
-    // 2. 輪郭単純化 (Douglas-Peucker)
-    let mut simplified_contours: Vec<Vec<(f32, f32)>> = Vec::new();
-    for loop_pts in &contour_loops {
-        let simplified = if loop_pts.len() > 3 {
-            simplify::simplify_loop(loop_pts, epsilon)
-        } else {
-            loop_pts.clone()
-        };
-        if simplified.len() >= 3 {
-            simplified_contours.push(simplified);
-        }
-    }
-
-    // 3. 全輪郭点を集約 + 制約エッジ作成
-    let mut all_points: Vec<(f32, f32)> = Vec::new();
-    let mut constraint_edges: Vec<(usize, usize)> = Vec::new();
-
-    for contour in &simplified_contours {
-        let base = all_points.len();
-        for pt in contour {
-            all_points.push(*pt);
-        }
-        // ループの制約エッジ
-        let cn = contour.len();
-        for i in 0..cn {
-            constraint_edges.push((base + i, base + (i + 1) % cn));
-        }
-    }
-
-    let _contour_point_count = all_points.len();
-
-    // 4. 内部点サンプリング (Poisson Disk Sampling)
-    // パディング後のサイズで処理する
-    let seed = (w as u64 * 31337 + h as u64 * 7919 + density as u64 * 104729) | 1;
-    let interior_pts = poisson::poisson_disk_sample(
-        padded_w,
-        padded_h,
-        min_spacing,
-        &dilated_alpha,
-        1, // 膨張済みなのでしきい値1で十分
-        &all_points,
-        seed,
-    );
-    all_points.extend_from_slice(&interior_pts);
-
-    // 最低3点必要
-    if all_points.len() < 3 {
-        let hw = w as f32 * 0.5;
-        let hh = h as f32 * 0.5;
-        all_points.clear();
-        all_points.push((-hw, -hh));
-        all_points.push((hw, -hh));
-        all_points.push((hw, hh));
-        all_points.push((-hw, hh));
-        constraint_edges.clear();
-    }
-
-    // 5. 制約付き Delaunay 三角形分割
-    let tris = delaunay::triangulate(
-        &all_points,
-        &constraint_edges,
-        &dilated_alpha,
-        padded_w,
-        padded_h,
-        1, // 膨張済みなのでしきい値1で十分
-    );
-
-    // 結果をC互換メモリに変換
-    let vertex_count = all_points.len() as u32;
-    let index_count = (tris.len() * 3) as u32;
-
-    let vertices = if vertex_count > 0 {
-        let mut verts = Vec::with_capacity(all_points.len() * 2);
-        for &(x, y) in &all_points {
-            verts.push(x);
-            verts.push(y);
-        }
-        let ptr = verts.as_mut_ptr();
-        std::mem::forget(verts);
-        ptr
-    } else {
-        std::ptr::null_mut()
-    };
-
-    let indices = if index_count > 0 {
-        let mut idxs = Vec::with_capacity(tris.len() * 3);
-        for tri in &tris {
-            idxs.push(tri[0] as u32);
-            idxs.push(tri[1] as u32);
-            idxs.push(tri[2] as u32);
-        }
-        let ptr = idxs.as_mut_ptr();
-        std::mem::forget(idxs);
-        ptr
-    } else {
-        std::ptr::null_mut()
-    };
-
-    Box::into_raw(Box::new(MeshResult {
-        vertices,
-        vertex_count,
-        indices,
-        index_count,
-    }))
+    Ok((vertices, indices))
 }
 
-/// MeshResult を解放する。
-///
-/// Lua側で結果を使い終わった後に呼び出す。
-#[no_mangle]
-pub extern "C" fn puppet_mesh_free(result: *mut MeshResult) {
-    if result.is_null() {
-        return;
-    }
-    unsafe {
-        let r = Box::from_raw(result);
-        if !r.vertices.is_null() && r.vertex_count > 0 {
-            let _ = Vec::from_raw_parts(r.vertices, (r.vertex_count * 2) as usize, (r.vertex_count * 2) as usize);
+struct Mesh {
+    points: Vec<(f32, f32)>,
+    triangles: Vec<[usize; 3]>,
+}
+
+fn checked_image_layout(width: i32, height: i32) -> AnyResult<(usize, usize, usize)> {
+    anyhow::ensure!(width > 0 && height > 0, "image dimensions must be positive");
+
+    let width = usize::try_from(width).context("invalid image width")?;
+    let height = usize::try_from(height).context("invalid image height")?;
+    let byte_len = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(RGBA_CHANNELS))
+        .context("RGBA image dimensions are too large")?;
+
+    // Rust slices use isize-sized offsets. Reject impossible layouts before
+    // constructing one from the host-owned pointer.
+    anyhow::ensure!(byte_len <= isize::MAX as usize, "RGBA image is too large");
+    Ok((width, height, byte_len))
+}
+
+fn generate_mesh(
+    rgba: &[u8],
+    width: usize,
+    height: usize,
+    threshold: i32,
+    density: i32,
+    border_px: i32,
+) -> AnyResult<Mesh> {
+    let expected_len = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(RGBA_CHANNELS))
+        .context("RGBA image dimensions are too large")?;
+    anyhow::ensure!(
+        rgba.len() == expected_len,
+        "RGBA buffer length does not match its dimensions"
+    );
+
+    let threshold = threshold.clamp(0, 255) as u8;
+    let density = density.clamp(MIN_DENSITY, MAX_DENSITY) as usize;
+    let border = border_px.max(0) as f32;
+
+    let max_dim = width.max(height) as f32;
+    let min_spacing = max_dim / density as f32;
+    let epsilon = min_spacing * 0.4;
+
+    // Douglas-Peucker may move a contour inward by epsilon. Dilating by the
+    // requested border plus epsilon prevents that simplification from cutting
+    // into opaque pixels.
+    let total_dilate = border + epsilon;
+    let pad = total_dilate.ceil() as usize + 2;
+    let padded_width = width
+        .checked_add(pad.checked_mul(2).context("mesh padding is too large")?)
+        .context("padded image width is too large")?;
+    let padded_height = height
+        .checked_add(pad.checked_mul(2).context("mesh padding is too large")?)
+        .context("padded image height is too large")?;
+    let padded_len = padded_width
+        .checked_mul(padded_height)
+        .context("padded image is too large")?;
+
+    let mut binary = vec![false; padded_len];
+    for y in 0..height {
+        let src_row = y * width * RGBA_CHANNELS;
+        let dst_row = (y + pad) * padded_width + pad;
+        for x in 0..width {
+            binary[dst_row + x] = rgba[src_row + x * RGBA_CHANNELS + 3] >= threshold;
         }
-        if !r.indices.is_null() && r.index_count > 0 {
-            let _ = Vec::from_raw_parts(r.indices, r.index_count as usize, r.index_count as usize);
+    }
+
+    if total_dilate > 0.0 {
+        dilate::dilate_edt(&mut binary, padded_width, padded_height, total_dilate);
+    }
+
+    let dilated_alpha: Vec<u8> = binary
+        .iter()
+        .map(|&opaque| if opaque { 255 } else { 0 })
+        .collect();
+    let contours = contour::extract_contours_from_binary(&binary, padded_width, padded_height);
+
+    let simplified_contours: Vec<Vec<(f32, f32)>> = contours
+        .iter()
+        .filter_map(|points| {
+            let simplified = if points.len() > 3 {
+                simplify::simplify_loop(points, epsilon)
+            } else {
+                points.clone()
+            };
+            (simplified.len() >= 3).then_some(simplified)
+        })
+        .collect();
+
+    let mut points = Vec::new();
+    let mut constraint_edges = Vec::new();
+    for contour in simplified_contours {
+        let base = points.len();
+        let count = contour.len();
+        points.extend(contour);
+        for index in 0..count {
+            constraint_edges.push((base + index, base + (index + 1) % count));
         }
     }
+
+    let seed = (width as u64 * 31_337 + height as u64 * 7_919 + density as u64 * 104_729) | 1;
+    points.extend(poisson::poisson_disk_sample(
+        padded_width,
+        padded_height,
+        min_spacing,
+        &dilated_alpha,
+        1,
+        &points,
+        seed,
+    ));
+
+    if points.len() < 3 {
+        return Ok(Mesh {
+            points: Vec::new(),
+            triangles: Vec::new(),
+        });
+    }
+
+    let triangles = delaunay::triangulate(
+        &points,
+        &constraint_edges,
+        &dilated_alpha,
+        padded_width,
+        padded_height,
+        1,
+    );
+
+    if triangles.is_empty() {
+        points.clear();
+    }
+
+    Ok(Mesh { points, triangles })
 }
 
 #[cfg(test)]
@@ -256,63 +314,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_full_pipeline() {
-        // 32x32の円形α画像
-        let w: usize = 32;
-        let h: usize = 32;
-        let hw = w as f32 * 0.5;
-        let hh = h as f32 * 0.5;
-        let r = 12.0f32;
-
-        let mut rgba = vec![0u8; w * h * 4];
-        for y in 0..h {
-            for x in 0..w {
-                let dx = x as f32 - hw;
-                let dy = y as f32 - hh;
-                if dx * dx + dy * dy <= r * r {
-                    let idx = (y * w + x) * 4;
-                    rgba[idx] = 255;     // R
-                    rgba[idx + 1] = 255; // G
-                    rgba[idx + 2] = 255; // B
-                    rgba[idx + 3] = 255; // A
+    fn full_pipeline_generates_valid_indices() {
+        let width = 32;
+        let height = 32;
+        let mut rgba = vec![0_u8; width * height * RGBA_CHANNELS];
+        for y in 0..height {
+            for x in 0..width {
+                let dx = x as f32 - width as f32 * 0.5;
+                let dy = y as f32 - height as f32 * 0.5;
+                if dx * dx + dy * dy <= 12.0 * 12.0 {
+                    rgba[(y * width + x) * RGBA_CHANNELS + 3] = 255;
                 }
             }
         }
 
-        let result = puppet_mesh_generate(rgba.as_ptr(), w as i32, h as i32, 128, 10, 0);
-        assert!(!result.is_null());
-
-        unsafe {
-            let r = &*result;
-            assert!(r.vertex_count > 0, "頂点が生成されるべき: {}", r.vertex_count);
-            assert!(r.index_count > 0, "インデックスが生成されるべき: {}", r.index_count);
-            assert_eq!(r.index_count % 3, 0, "インデックス数は3の倍数であるべき");
-
-            // 全インデックスが有効範囲内であることを確認
-            for i in 0..r.index_count as usize {
-                let idx = *r.indices.add(i);
-                assert!(
-                    idx < r.vertex_count,
-                    "インデックス{}が範囲外: {} >= {}",
-                    i,
-                    idx,
-                    r.vertex_count
-                );
-            }
-        }
-
-        puppet_mesh_free(result);
+        let mesh = generate_mesh(&rgba, width, height, 128, 10, 0).unwrap();
+        assert!(!mesh.points.is_empty());
+        assert!(!mesh.triangles.is_empty());
+        assert!(
+            mesh.triangles
+                .iter()
+                .flatten()
+                .all(|&index| index < mesh.points.len())
+        );
     }
 
     #[test]
-    fn test_null_input() {
-        let result = puppet_mesh_generate(std::ptr::null(), 0, 0, 128, 10, 0);
-        assert!(!result.is_null());
-        unsafe {
-            let r = &*result;
-            assert_eq!(r.vertex_count, 0);
-            assert_eq!(r.index_count, 0);
-        }
-        puppet_mesh_free(result);
+    fn transparent_image_returns_an_empty_mesh() {
+        let rgba = vec![0_u8; 16 * 16 * RGBA_CHANNELS];
+        let mesh = generate_mesh(&rgba, 16, 16, 128, 10, 0).unwrap();
+        assert!(mesh.points.is_empty());
+        assert!(mesh.triangles.is_empty());
+    }
+
+    #[test]
+    fn rejects_mismatched_buffer_length() {
+        let error = generate_mesh(&[0; 3], 1, 1, 128, 10, 0)
+            .err()
+            .expect("invalid buffer should fail");
+        assert!(error.to_string().contains("buffer length"));
+    }
+
+    #[test]
+    fn rejects_invalid_dimensions() {
+        assert!(checked_image_layout(0, 10).is_err());
+        assert!(checked_image_layout(10, -1).is_err());
     }
 }

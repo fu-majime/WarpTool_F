@@ -1,11 +1,12 @@
-/// Douglas-Peucker 輪郭単純化アルゴリズム
-///
-/// 輪郭線の点数を減らしながら、形状の特徴を保持する。
-/// ※安全マージン（epsilon分の事前膨張）と組み合わせることで、
-/// 　不透明領域を一切損なわず、かつピクセル階段を大幅にジャンプする
-/// 　クリーンなポリゴンを生成する。
+//! Douglas-Peucker 輪郭単純化アルゴリズム
+//!
+//! 輪郭線の点数を減らしながら、形状の特徴を保持する。
+//! ※安全マージン（epsilon分の事前膨張）と組み合わせることで、
+//! 　不透明領域を一切損なわず、かつピクセル階段を大幅にジャンプする
+//! 　クリーンなポリゴンを生成する。
 
 /// Douglas-Peucker アルゴリズムで輪郭を単純化する。
+#[cfg(test)]
 pub fn simplify(points: &[(f32, f32)], epsilon: f32) -> Vec<(f32, f32)> {
     let n = points.len();
     if n <= 2 {
@@ -73,13 +74,7 @@ fn find_farthest_pair(points: &[(f32, f32)]) -> (usize, usize) {
     pair
 }
 
-fn dp_recursive(
-    points: &[(f32, f32)],
-    start: usize,
-    end: usize,
-    epsilon: f32,
-    keep: &mut [bool],
-) {
+fn dp_recursive(points: &[(f32, f32)], start: usize, end: usize, epsilon: f32, keep: &mut [bool]) {
     if end <= start + 1 {
         return;
     }
@@ -138,8 +133,8 @@ fn farthest_from_line(points: &[(f32, f32)], start: usize, end: usize) -> (usize
     let mut max_dist = 0.0f32;
     let mut max_idx = start;
 
-    for i in (start + 1)..end {
-        let d = point_to_line_dist(points[i], a, b);
+    for (i, point) in points.iter().enumerate().take(end).skip(start + 1) {
+        let d = point_to_line_dist(*point, a, b);
         if d > max_dist {
             max_dist = d;
             max_idx = i;
@@ -180,9 +175,17 @@ mod tests {
     #[test]
     fn test_simplify_preserves_corners() {
         let points = vec![
-            (0.0, 0.0), (1.0, 0.0), (2.0, 0.0), (3.0, 0.0),
-            (4.0, 0.0), (5.0, 0.0), (5.0, 1.0), (5.0, 2.0),
-            (5.0, 3.0), (5.0, 4.0), (5.0, 5.0),
+            (0.0, 0.0),
+            (1.0, 0.0),
+            (2.0, 0.0),
+            (3.0, 0.0),
+            (4.0, 0.0),
+            (5.0, 0.0),
+            (5.0, 1.0),
+            (5.0, 2.0),
+            (5.0, 3.0),
+            (5.0, 4.0),
+            (5.0, 5.0),
         ];
         let result = simplify(&points, 0.1);
         assert_eq!(result.len(), 3);

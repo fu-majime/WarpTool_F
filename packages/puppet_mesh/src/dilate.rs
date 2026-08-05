@@ -1,7 +1,7 @@
-/// 高速縁取り膨張（Euclidean Distance Transformベース）
-///
-/// α二値画像に対して、外側方向にのみ正確に膨張させる。
-/// Meijster/Roerdink/Hesselink の O(w×h) EDT アルゴリズムを使用。
+//! 高速縁取り膨張（Euclidean Distance Transformベース）
+//!
+//! α二値画像に対して、外側方向にのみ正確に膨張させる。
+//! Meijster/Roerdink/Hesselink の O(w×h) EDT アルゴリズムを使用。
 
 /// 二値マップを指定半径だけ外側に膨張する。
 ///

@@ -1,7 +1,7 @@
-/// Poisson Disk Sampling (Bridsonのアルゴリズム)
-///
-/// 均一で自然なランダム点分布を生成する。
-/// 格子状にならないのが格子サンプリングとの最大の違い。
+//! Poisson Disk Sampling (Bridsonのアルゴリズム)
+//!
+//! 均一で自然なランダム点分布を生成する。
+//! 格子状にならないのが格子サンプリングとの最大の違い。
 
 /// Bridsonの高速Poisson Disk Sampling。
 ///
@@ -74,7 +74,15 @@ pub fn poisson_disk_sample(
         let iy = py as usize;
         if ix < w && iy < h && alpha[iy * w + ix] >= threshold {
             // 輪郭点との距離チェック
-            if is_valid_point(px, py, &all_pts, &grid, grid_w, grid_h, cell_size, min_dist2) {
+            if is_valid_point(
+                px,
+                py,
+                &all_pts,
+                &grid,
+                (grid_w, grid_h),
+                cell_size,
+                min_dist2,
+            ) {
                 let idx = all_pts.len();
                 all_pts.push((px, py));
                 let gx = (px / cell_size) as usize;
@@ -91,18 +99,44 @@ pub fn poisson_disk_sample(
     }
 
     if !initial_found {
-        // α領域の中心付近を強制使用
-        let cx = w as f32 * 0.5;
-        let cy = h as f32 * 0.5;
-        let idx = all_pts.len();
-        all_pts.push((cx, cy));
-        let gx = (cx / cell_size) as usize;
-        let gy = (cy / cell_size) as usize;
-        if gx < grid_w && gy < grid_h {
-            grid[gy * grid_w + gx] = Some(idx);
+        // Small or disconnected opaque regions are easy to miss with random
+        // probes. Search deterministically instead of injecting the image
+        // centre, which may be fully transparent or inside a hole.
+        'find_seed: for y in 0..h {
+            for x in 0..w {
+                if alpha[y * w + x] < threshold {
+                    continue;
+                }
+
+                let px = x as f32 + 0.5;
+                let py = y as f32 + 0.5;
+                if !is_valid_point(
+                    px,
+                    py,
+                    &all_pts,
+                    &grid,
+                    (grid_w, grid_h),
+                    cell_size,
+                    min_dist2,
+                ) {
+                    continue;
+                }
+
+                let idx = all_pts.len();
+                all_pts.push((px, py));
+                let gx = (px / cell_size) as usize;
+                let gy = (py / cell_size) as usize;
+                grid[gy * grid_w + gx] = Some(idx);
+                points.push((px, py));
+                active.push(idx);
+                initial_found = true;
+                break 'find_seed;
+            }
         }
-        points.push((cx, cy));
-        active.push(idx);
+    }
+
+    if !initial_found {
+        return Vec::new();
     }
 
     // Bridsonのメインループ
@@ -131,7 +165,15 @@ pub fn poisson_disk_sample(
                 continue;
             }
 
-            if is_valid_point(nx, ny, &all_pts, &grid, grid_w, grid_h, cell_size, min_dist2) {
+            if is_valid_point(
+                nx,
+                ny,
+                &all_pts,
+                &grid,
+                (grid_w, grid_h),
+                cell_size,
+                min_dist2,
+            ) {
                 let new_idx = all_pts.len();
                 all_pts.push((nx, ny));
                 let gx = (nx / cell_size) as usize;
@@ -160,11 +202,11 @@ fn is_valid_point(
     y: f32,
     all_pts: &[(f32, f32)],
     grid: &[Option<usize>],
-    grid_w: usize,
-    grid_h: usize,
+    grid_size: (usize, usize),
     cell_size: f32,
     min_dist2: f32,
 ) -> bool {
+    let (grid_w, grid_h) = grid_size;
     let gx = (x / cell_size) as i32;
     let gy = (y / cell_size) as i32;
 
@@ -173,14 +215,17 @@ fn is_valid_point(
         for dx in -2..=2 {
             let nx = gx + dx;
             let ny = gy + dy;
-            if nx >= 0 && nx < grid_w as i32 && ny >= 0 && ny < grid_h as i32 {
-                if let Some(idx) = grid[(ny as usize) * grid_w + (nx as usize)] {
-                    let (px, py) = all_pts[idx];
-                    let ddx = x - px;
-                    let ddy = y - py;
-                    if ddx * ddx + ddy * ddy < min_dist2 {
-                        return false;
-                    }
+            if nx >= 0
+                && nx < grid_w as i32
+                && ny >= 0
+                && ny < grid_h as i32
+                && let Some(idx) = grid[(ny as usize) * grid_w + (nx as usize)]
+            {
+                let (px, py) = all_pts[idx];
+                let ddx = x - px;
+                let ddy = y - py;
+                if ddx * ddx + ddy * ddy < min_dist2 {
+                    return false;
                 }
             }
         }
@@ -231,14 +276,31 @@ mod tests {
             }
         }
         let points = poisson_disk_sample(w, h, 10.0, &alpha, 128, &[], 42);
-        let hw = w as f32 * 0.5;
         for &(px, _) in &points {
             // 中心原点なので左半分は px < 0
-            assert!(
-                px < 1.0,
-                "右半分(透明領域)に点がある: x={}",
-                px
-            );
+            assert!(px < 1.0, "右半分(透明領域)に点がある: x={}", px);
+        }
+    }
+
+    #[test]
+    fn test_poisson_empty_region_returns_no_points() {
+        let alpha = vec![0u8; 32 * 32];
+        let points = poisson_disk_sample(32, 32, 10.0, &alpha, 128, &[], 42);
+        assert!(points.is_empty());
+    }
+
+    #[test]
+    fn test_poisson_tiny_region_does_not_fall_back_to_transparent_center() {
+        let w = 100;
+        let h = 100;
+        let mut alpha = vec![0u8; w * h];
+        alpha[3 * w + 2] = 255;
+
+        let points = poisson_disk_sample(w, h, 10.0, &alpha, 128, &[], 1);
+        for &(x, y) in &points {
+            let image_x = (x + w as f32 * 0.5) as usize;
+            let image_y = (y + h as f32 * 0.5) as usize;
+            assert!(alpha[image_y * w + image_x] >= 128);
         }
     }
 }

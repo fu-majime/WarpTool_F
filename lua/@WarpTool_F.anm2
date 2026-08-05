@@ -1,5 +1,5 @@
 @方向波形ワープ(パラメータ)
---information:方向波形ワープ(パラメータ)@WarpTool_F v0.0.0 by Fu-Majime
+--information:方向波形ワープ(パラメータ)@WarpTool_F v0.0.1 by Fu-Majime
 --label:変形\WarpTool_F
 --group:基本設定,true
 --track@height:高さ,0,4000,100
@@ -652,7 +652,7 @@ main()
 
 
 @方向波形ワープ(配置)
---information:方向波形ワープ(配置)@WarpTool_F v0.0.0 by Fu-Majime
+--information:方向波形ワープ(配置)@WarpTool_F v0.0.1 by Fu-Majime
 --label:変形\WarpTool_F
 --group:基本設定,true
 --value@waveLayout:波形配置,{0,-100,0,0,100,0}
@@ -794,7 +794,7 @@ end
 main()
 
 @放射回転波形ワープ(没)
---information:放射回転波形ワープ(パラメータ)@WarpTool_F v0.0.0 by Fu-Majime
+--information:放射回転波形ワープ(パラメータ)@WarpTool_F v0.0.1 by Fu-Majime
 --label:変形\WarpTool_F
 --group:基本設定,true
 --value@center:中心,{0,0}
@@ -1152,7 +1152,7 @@ main()
 
 
 @メッシュ変形
---information:メッシュ変形@WarpTool_F v0.0.0 by Fu-Majime
+--information:メッシュ変形@WarpTool_F v0.0.1 by Fu-Majime
 --label:変形\WarpTool_F
 --track@ratio:変形率,0,100,100
 --track@posw:横格子点,2,20,5,1
@@ -1359,13 +1359,14 @@ obj.cy = obj.cy-sy
 obj.setoption("focus_mode","fixed_size")
 
 @パペットツール
---information:パペットツール@WarpTool_F v0.0.0 by Fu-Majime
+--information:パペットツール@WarpTool_F v0.0.1 by Fu-Majime
 --label:変形\WarpTool_F
 --track@ratio:変形率,0,100,100
---track@pins:ピン数,3,20,3,1
+--track@pins:ピン数,1,20,3,1
 --track@density:メッシュ密度,5,50,15,1
 --track@div:分割数,1,10,3,1
 --track@stiff:硬さ,0.01,2,1,0.01
+--check@edit_source:ピン止め操作,true
 --group:詳細設定,false
 --track@threshold:しきい値,0,255,1,1
 --track@border:縁取り膨張,0,100,0,1
@@ -1423,27 +1424,60 @@ if #dst ~= #default_pins then
 	for i = 1, #src do dst[i] = src[i] end
 end
 
--- アンカー設定: 2組のアンカーを表示
--- src = 変形元（緑系）: ユーザーがキャラの関節等に配置
--- dst = 変形先（赤系）: ユーザーが変形後の位置に配置
-obj.setanchor("src", pins, default_pins, "small", "rgba", 0x00ff8060)
-obj.setanchor("dst", pins, src, "small", "rgba", 0xff400060)
+-- アンカー設定: チェック中は変形元、チェックを外すと変形先を操作する TODO ピン制御時は使わないときもあるはず
+if show then
+    if edit_source then
+        obj.setanchor("src", pins, default_pins, "rgba", 0x20e060e0)
+    else
+        obj.setanchor("dst", pins, src, "rgba", 0xf05050e0)
+    end
+end
 
 -- 変形率を反映
 local pin_sx, pin_sy = {}, {}  -- 変形元
+local pin_tx, pin_ty = {}, {}  -- 変形先（ratio反映前）
 local pin_dx, pin_dy = {}, {}  -- 変形先（ratio反映済み）
 local pin_layer = {}           -- ユーザーが後から整数を足し算してレイヤー調整できるよう用意
 local any_moved = false
+
+-- ピン制御から値を取得
+local effect_overrides = {}
+local fx_idx = 0
+while true do
+	local effect_name = "パペットツール@ピン制御@WarpTool_F:" .. fx_idx
+	local ok, pin_num = pcall(function() return obj.getvalue(effect_name, "番号") end)
+	if not ok or pin_num == nil then break end
+
+	local ok_x, pin_x = pcall(function() return obj.getvalue(effect_name, "X") end)
+	local ok_y, pin_y = pcall(function() return obj.getvalue(effect_name, "Y") end)
+
+	if ok_x and pin_x ~= nil and ok_y and pin_y ~= nil then
+		effect_overrides[math.floor(pin_num)] = { pin_x, pin_y }
+	end
+	fx_idx = fx_idx + 1
+end
+
 for i = 1, pins do
 	pin_layer[i] = 0
 	pin_sx[i] = src[i * 2 - 1]
 	pin_sy[i] = src[i * 2]
+
+	local base_dx = dst[i * 2 - 1]
+	local base_dy = dst[i * 2]
+
+	if effect_overrides[i] then
+		base_dx = effect_overrides[i][1]
+		base_dy = effect_overrides[i][2]
+	end
+	pin_tx[i] = base_dx
+	pin_ty[i] = base_dy
+
 	if ratio < 100 then
-		pin_dx[i] = src[i * 2 - 1] + (dst[i * 2 - 1] - src[i * 2 - 1]) * ratio / 100
-		pin_dy[i] = src[i * 2]     + (dst[i * 2]     - src[i * 2])     * ratio / 100
+		pin_dx[i] = src[i * 2 - 1] + (pin_tx[i] - src[i * 2 - 1]) * ratio / 100
+		pin_dy[i] = src[i * 2]     + (pin_ty[i] - src[i * 2])     * ratio / 100
 	else
-		pin_dx[i] = dst[i * 2 - 1]
-		pin_dy[i] = dst[i * 2]
+		pin_dx[i] = pin_tx[i]
+		pin_dy[i] = pin_ty[i]
 	end
 	if pin_sx[i] ~= pin_dx[i] or pin_sy[i] ~= pin_dy[i] then
 		any_moved = true
@@ -1554,106 +1588,112 @@ local mesh_x, mesh_y = {}, {}
 local mesh_tris = {}
 local mesh_n_verts = 0
 
--- DLL呼び出し
-local ffi_ok, ffi = pcall(require, "ffi")
-if ffi_ok then
-    pcall(function()
-        ffi.cdef[[
-            typedef struct {
-                float* vertices;
-                uint32_t vertex_count;
-                uint32_t* indices;
-                uint32_t index_count;
-            } MeshResult;
-            MeshResult* puppet_mesh_generate(
-                const uint8_t* data, int32_t w, int32_t h,
-                int32_t threshold, int32_t density, int32_t border_px);
-            void puppet_mesh_free(MeshResult* result);
-        ]]
-    end)
-    pcall(require, "puppet_mesh")
-    dll_ok, dll = pcall(ffi.load, "puppet_mesh")
-    debug_print("dll_ok: " .. tostring(dll_ok))
-    if dll_ok then
-        puppet_mesh_dll = dll
-        puppet_mesh_ffi = ffi
-    end
+-- AviUtl2スクリプトモジュールからLua配列としてメッシュを受け取る。
+-- FFIポインタやRust側メモリの所有権をスクリプトへ持ち出さない。
+local function import_module_mesh(vertices, indices)
+	if type(vertices) ~= "table" or type(indices) ~= "table" or
+		#vertices < 6 or #vertices % 2 ~= 0 or
+		#indices < 3 or #indices % 3 ~= 0 then
+		return false
+	end
+
+	local vertex_count = #vertices / 2
+	for i = 1, #vertices, 2 do
+		local x, y = vertices[i], vertices[i + 1]
+		if type(x) ~= "number" or type(y) ~= "number" then return false end
+		mesh_x[(i + 1) / 2] = x
+		mesh_y[(i + 1) / 2] = y
+	end
+
+	for i = 1, #indices, 3 do
+		local i0, i1, i2 = indices[i], indices[i + 1], indices[i + 2]
+		if type(i0) ~= "number" or type(i1) ~= "number" or type(i2) ~= "number" or
+			i0 ~= math.floor(i0) or i1 ~= math.floor(i1) or i2 ~= math.floor(i2) or
+			i0 < 0 or i0 >= vertex_count or
+			i1 < 0 or i1 >= vertex_count or
+			i2 < 0 or i2 >= vertex_count then
+			mesh_x, mesh_y, mesh_tris = {}, {}, {}
+			return false
+		end
+		mesh_tris[#mesh_tris + 1] = { i0 + 1, i1 + 1, i2 + 1 }
+	end
+
+	mesh_n_verts = vertex_count
+	return true
 end
 
-if puppet_mesh_dll then
-    -- DLLでメッシュ生成
-    local data, pw, ph = obj.getpixeldata("object", "rgba")
-    local result = puppet_mesh_dll.puppet_mesh_generate(
-        puppet_mesh_ffi.cast("const uint8_t*", data),
-        pw, ph, threshold, density, border)
-
-    if result ~= nil and result.vertex_count >= 3 and result.index_count >= 3 then
-        mesh_n_verts = result.vertex_count
-        for i = 0, mesh_n_verts - 1 do
-            mesh_x[i + 1] = result.vertices[i * 2]
-            mesh_y[i + 1] = result.vertices[i * 2 + 1]
-        end
-        local tri_count = math.floor(result.index_count / 3)
-        for i = 0, tri_count - 1 do
-            mesh_tris[i + 1] = {
-                result.indices[i * 3] + 1,
-                result.indices[i * 3 + 1] + 1,
-                result.indices[i * 3 + 2] + 1
-            }
-        end
-        puppet_mesh_dll.puppet_mesh_free(result)
-    else
-        if result ~= nil then
-            puppet_mesh_dll.puppet_mesh_free(result)
-        end
-        -- フォールバック: 四隅
-        mesh_n_verts = 4
-        mesh_x = { -hw, hw, hw, -hw }
-        mesh_y = { -hh, -hh, hh, hh }
-        mesh_tris = { { 1, 2, 3 }, { 1, 3, 4 } }
-    end
+local module_ok, mesh_module = pcall(function()
+	return obj.module("puppet_mesh")
+end)
+local generated = false
+local module_error = nil
+if not module_ok then
+	module_error = "obj.module(): " .. tostring(mesh_module)
+elseif type(mesh_module) ~= "table" or type(mesh_module.generate) ~= "function" then
+	module_error = "generate関数が登録されていません"
 else
-    -- DLLが無い場合のフォールバック: 格子点の座標を取得
-    local cell_size = math.max(w, h) / density
-    local cols = math.ceil(w / cell_size)
-    local rows = math.ceil(h / cell_size)
-    local cw = w / cols
-    local ch = h / rows
+	local call_ok, vertices, indices = pcall(function()
+		local data, pw, ph = obj.getpixeldata("object", "rgba")
+		return mesh_module.generate(data, pw, ph, threshold, density, border)
+	end)
+	if not call_ok then
+		module_error = "generate(): " .. tostring(vertices)
+	else
+		generated = import_module_mesh(vertices, indices)
+		if not generated then module_error = "不正または空のメッシュが返されました" end
+	end
+end
 
-    mesh_n_verts = (rows + 1) * (cols + 1)
-    for iy = 0, rows do
-        for ix = 0, cols do
-            local idx = iy * (cols + 1) + ix + 1
-            mesh_x[idx] = ix * cw - hw
-            mesh_y[idx] = iy * ch - hh
-        end
-    end
+if module_error and not puppet_mesh_error_reported then
+	print("@warn", "puppet_mesh.mod2: " .. module_error .. " (格子メッシュを使用します)")
+	puppet_mesh_error_reported = true
+elseif generated then
+	puppet_mesh_error_reported = false
+end
 
-    local function grid_idx(ix, iy)
-        return iy * (cols + 1) + ix + 1
-    end
+if not generated then
+	-- モジュールが無い、エラー、または空メッシュの場合の格子フォールバック。
+	mesh_x, mesh_y, mesh_tris = {}, {}, {}
+	local cell_size = math.max(w, h) / density
+	local cols = math.max(1, math.ceil(w / cell_size))
+	local rows = math.max(1, math.ceil(h / cell_size))
+	local cw = w / cols
+	local ch = h / rows
 
-    for iy = 0, rows - 1 do
-        for ix = 0, cols - 1 do
-            local i0 = grid_idx(ix,     iy)
-            local i1 = grid_idx(ix + 1, iy)
-            local i2 = grid_idx(ix + 1, iy + 1)
-            local i3 = grid_idx(ix,     iy + 1)
+	mesh_n_verts = (rows + 1) * (cols + 1)
+	for iy = 0, rows do
+		for ix = 0, cols do
+			local idx = iy * (cols + 1) + ix + 1
+			mesh_x[idx] = ix * cw - hw
+			mesh_y[idx] = iy * ch - hh
+		end
+	end
 
-            if check_alpha_at((mesh_x[i0]+mesh_x[i1]+mesh_x[i2])/3, (mesh_y[i0]+mesh_y[i1]+mesh_y[i2])/3) or
-                check_alpha_at(mesh_x[i0], mesh_y[i0]) or
-                check_alpha_at(mesh_x[i1], mesh_y[i1]) or
-                check_alpha_at(mesh_x[i2], mesh_y[i2]) then
-                table.insert(mesh_tris, { i0, i1, i2 })
-            end
-            if check_alpha_at((mesh_x[i0]+mesh_x[i2]+mesh_x[i3])/3, (mesh_y[i0]+mesh_y[i2]+mesh_y[i3])/3) or
-                check_alpha_at(mesh_x[i0], mesh_y[i0]) or
-                check_alpha_at(mesh_x[i2], mesh_y[i2]) or
-                check_alpha_at(mesh_x[i3], mesh_y[i3]) then
-                table.insert(mesh_tris, { i0, i2, i3 })
-            end
-        end
-    end
+	local function grid_idx(ix, iy)
+		return iy * (cols + 1) + ix + 1
+	end
+
+	for iy = 0, rows - 1 do
+		for ix = 0, cols - 1 do
+			local i0 = grid_idx(ix,     iy)
+			local i1 = grid_idx(ix + 1, iy)
+			local i2 = grid_idx(ix + 1, iy + 1)
+			local i3 = grid_idx(ix,     iy + 1)
+
+			if check_alpha_at((mesh_x[i0]+mesh_x[i1]+mesh_x[i2])/3, (mesh_y[i0]+mesh_y[i1]+mesh_y[i2])/3) or
+				check_alpha_at(mesh_x[i0], mesh_y[i0]) or
+				check_alpha_at(mesh_x[i1], mesh_y[i1]) or
+				check_alpha_at(mesh_x[i2], mesh_y[i2]) then
+				table.insert(mesh_tris, { i0, i1, i2 })
+			end
+			if check_alpha_at((mesh_x[i0]+mesh_x[i2]+mesh_x[i3])/3, (mesh_y[i0]+mesh_y[i2]+mesh_y[i3])/3) or
+				check_alpha_at(mesh_x[i0], mesh_y[i0]) or
+				check_alpha_at(mesh_x[i2], mesh_y[i2]) or
+				check_alpha_at(mesh_x[i3], mesh_y[i3]) then
+				table.insert(mesh_tris, { i0, i2, i3 })
+			end
+		end
+	end
 end
 
 local pin_dist = get_geodesic_distances(pins, pin_sx, pin_sy, mesh_n_verts, mesh_x, mesh_y, mesh_tris)
@@ -1728,6 +1768,7 @@ for i = 1, mesh_n_verts do
 	def_x[i], def_y[i] = dx, dy
 	def_layer[i] = (mesh_y[i] + hh) / h + loff
 end
+local show_gui = show and obj.getoption("gui")
 
 -- =============================================================
 -- 5. 描画バッファ設定
@@ -1746,10 +1787,23 @@ else
 		if def_y[i] and def_y[i] < minby then minby = def_y[i] end
 		if def_y[i] and def_y[i] > maxby then maxby = def_y[i] end
 	end
+	-- ガイドも描画バッファへ収め、長く移動したピンの線や点を欠けさせない。
+	if show_gui then
+		for i = 1, pins do
+			minbx = math.min(minbx, pin_sx[i], pin_tx[i])
+			maxbx = math.max(maxbx, pin_sx[i], pin_tx[i])
+			minby = math.min(minby, pin_sy[i], pin_ty[i])
+			maxby = math.max(maxby, pin_sy[i], pin_ty[i])
+		end
+	end
 	if minbx > maxbx then minbx = -hw; maxbx = hw end
 	if minby > maxby then minby = -hh; maxby = hh end
 	local mx = (maxbx - minbx) * 0.1
 	local my = (maxby - minby) * 0.1
+	if show_gui then
+		mx = math.max(mx, 16)
+		my = math.max(my, 16)
+	end
 	minbx = minbx - mx; maxbx = maxbx + mx
 	minby = minby - my; maxby = maxby + my
 	dstw = math.max(1, math.ceil(maxbx - minbx))
@@ -1852,12 +1906,13 @@ end
 -- =============================================================
 -- 7. 可視化（show=true）
 -- =============================================================
-if show and obj.getoption("gui") then
+if show_gui then
 	-- ワイヤーフレーム
 	local wire = {}
-	local lw = 0.8
-	local ca = 0.35
+	local lw = 1.2
+	local ca = 0.45
 	local cr, cg, cb = 0.0, 0.8 * ca, 1.0 * ca
+	local drawn_edges = {}
 
 	for ti = 1, #mesh_tris do
 		local tri = mesh_tris[ti]
@@ -1867,18 +1922,23 @@ if show and obj.getoption("gui") then
 			def_x[tri[3]] - sx_off, def_y[tri[3]] - sy_off
 		}
 		for e = 0, 2 do
-			local ax, ay = vx[e * 2 + 1], vx[e * 2 + 2]
 			local ne = ((e + 1) % 3)
-			local bx, by = vx[ne * 2 + 1], vx[ne * 2 + 2]
-			local edx, edy = bx - ax, by - ay
-			local elen = math.sqrt(edx * edx + edy * edy)
-			if elen > 0.1 then
-				local nx = -edy / elen * lw
-				local ny =  edx / elen * lw
-				table.insert(wire, { ax + nx, ay + ny, 0, cr, cg, cb, ca })
-				table.insert(wire, { bx + nx, by + ny, 0, cr, cg, cb, ca })
-				table.insert(wire, { bx - nx, by - ny, 0, cr, cg, cb, ca })
-				table.insert(wire, { ax - nx, ay - ny, 0, cr, cg, cb, ca })
+			local ia, ib = tri[e + 1], tri[ne + 1]
+			local edge_key = math.min(ia, ib) .. ":" .. math.max(ia, ib)
+			if not drawn_edges[edge_key] then
+				drawn_edges[edge_key] = true
+				local ax, ay = vx[e * 2 + 1], vx[e * 2 + 2]
+				local bx, by = vx[ne * 2 + 1], vx[ne * 2 + 2]
+				local edx, edy = bx - ax, by - ay
+				local elen = math.sqrt(edx * edx + edy * edy)
+				if elen > 0.1 then
+					local nx = -edy / elen * lw
+					local ny =  edx / elen * lw
+					table.insert(wire, { ax + nx, ay + ny, 0, cr, cg, cb, ca })
+					table.insert(wire, { bx + nx, by + ny, 0, cr, cg, cb, ca })
+					table.insert(wire, { bx - nx, by - ny, 0, cr, cg, cb, ca })
+					table.insert(wire, { ax - nx, ay - ny, 0, cr, cg, cb, ca })
+				end
 			end
 		end
 	end
@@ -1888,58 +1948,79 @@ if show and obj.getoption("gui") then
 		obj.drawpoly(wire)
 	end
 
-	-- ピンの線と矢印: 常にsrc→dstの全経路を表示
-	-- 緑の線 = src→dst(full)の経路、赤の矢印 = src→現在位置(ratio反映)
+	local function make_line(x1, y1, x2, y2, width, r, g, b, a)
+		local dx, dy = x2 - x1, y2 - y1
+		local len = math.sqrt(dx * dx + dy * dy)
+		if len <= 0.1 then return nil end
+		local nx, ny = -dy / len * width * 0.5, dx / len * width * 0.5
+		r, g, b = r * a, g * a, b * a
+		return {
+			x1 + nx, y1 + ny, 0, x2 + nx, y2 + ny, 0,
+			x2 - nx, y2 - ny, 0, x1 - nx, y1 - ny, 0,
+			r, g, b, a, r, g, b, a, r, g, b, a, r, g, b, a
+		}
+	end
+
+	-- src→dstの全経路と、src→現在位置（ratio反映）の矢印軸を一括描画する。
+	local pin_lines = {}
+	local arrow_lines = {}
+	local arrow_heads = {}
 	for i = 1, pins do
-		local ox = pin_sx[i] - sx_off  -- src位置
-		local oy = pin_sy[i] - sy_off
-		local fx = dst[i * 2 - 1] - sx_off  -- dst(full)位置
-		local fy = dst[i * 2]     - sy_off
-		local cx = pin_dx[i] - sx_off  -- 現在位置(ratio反映)
-		local cy = pin_dy[i] - sy_off
+		local ox, oy = pin_sx[i] - sx_off, pin_sy[i] - sy_off
+		local fx, fy = pin_tx[i] - sx_off, pin_ty[i] - sy_off
+		local cx, cy = pin_dx[i] - sx_off, pin_dy[i] - sy_off
+		local line = make_line(ox, oy, fx, fy,
+			4, 0.95, 0.75, 0.15, 0.80)
+		if line then table.insert(pin_lines, line) end
 
-		-- 緑の線: src→dst(full) — 常に全経路を表示
-		local fdx, fdy = fx - ox, fy - oy
-		local flen = math.sqrt(fdx * fdx + fdy * fdy)
-		if flen > 1 then
-			local ga = 0.45
-			local gr, gg, gb = 0.1 * ga, 0.9 * ga, 0.2 * ga
-			local gnx = -fdy / flen * 1.0
-			local gny =  fdx / flen * 1.0
-			obj.drawpoly({
-				{ ox + gnx, oy + gny, 0, gr, gg, gb, ga },
-				{ fx + gnx, fy + gny, 0, gr, gg, gb, ga },
-				{ fx - gnx, fy - gny, 0, gr, gg, gb, ga },
-				{ ox - gnx, oy - gny, 0, gr, gg, gb, ga }
-			})
-		end
-
-		-- 赤の矢印: src→現在位置(ratio反映)
 		local adx, ady = cx - ox, cy - oy
 		local alen = math.sqrt(adx * adx + ady * ady)
-		if alen > 2 then
-			local aa = 0.7
-			local ar, ag, ab = 1.0 * aa, 0.3 * aa, 0.1 * aa
-			local anx = -ady / alen * 1.5
-			local any =  adx / alen * 1.5
-			obj.drawpoly({
-				{ ox + anx, oy + any, 0, ar, ag, ab, aa },
-				{ cx + anx, cy + any, 0, ar, ag, ab, aa },
-				{ cx - anx, cy - any, 0, ar, ag, ab, aa },
-				{ ox - anx, oy - any, 0, ar, ag, ab, aa }
-			})
-			-- 矢印先端
-			local hlen = math.min(8, alen * 0.3)
-			local hw_a = hlen * 0.6
+		if alen > 1 then
+			local arrow = make_line(ox, oy, cx, cy, 4, 1.0, 0.30, 0.08, 0.90)
+			if arrow then table.insert(arrow_lines, arrow) end
+
+			-- 三角形図形の上端中央が現在位置に来るよう、UV付き四角形を置く。
 			local hx, hy = adx / alen, ady / alen
-			local bax, bay = cx - hx * hlen, cy - hy * hlen
-			obj.drawpoly({
-				{ cx, cy, 0, ar, ag, ab, aa },
-				{ bax + (-hy) * hw_a, bay + hx * hw_a, 0, ar, ag, ab, aa },
-				{ bax - (-hy) * hw_a, bay - hx * hw_a, 0, ar, ag, ab, aa }
-			}, 3)
+			local nx, ny = -hy, hx
+			local head_len = math.min(16, math.max(6, alen * 0.30))
+			local head_width = head_len * 0.9
+			local bx, by = cx - hx * head_len, cy - hy * head_len
+			table.insert(arrow_heads, { cx - nx * head_width * 0.5, cy - ny * head_width * 0.5, 0, 0, 0 })
+			table.insert(arrow_heads, { cx + nx * head_width * 0.5, cy + ny * head_width * 0.5, 0, 1, 0 })
+			table.insert(arrow_heads, { bx + nx * head_width * 0.5, by + ny * head_width * 0.5, 0, 1, 1 })
+			table.insert(arrow_heads, { bx - nx * head_width * 0.5, by - ny * head_width * 0.5, 0, 0, 1 })
 		end
 	end
+	if #pin_lines > 0 then
+		obj.setoption("blend", "alpha_add")
+		obj.drawpoly(pin_lines)
+	end
+	if #arrow_lines > 0 then
+		obj.drawpoly(arrow_lines)
+	end
+
+	-- 矢じりと点は既成図形を使う。操作側の点だけ大きく、不透明にする。
+	local saved_props = {
+		obj.ox, obj.oy, obj.oz, obj.cx, obj.cy, obj.cz,
+		obj.rx, obj.ry, obj.rz, obj.sx, obj.sy, obj.sz, obj.alpha
+	}
+	obj.setoption("drawtarget", "tempbuffer")
+	local point_base_size = 24
+	local function draw_points(xs, ys, color, active)
+		if not obj.load("figure", "円", color, point_base_size) then return end
+		local size = active and 24 or 16
+		local alpha = active and 1.0 or 0.55
+		for i = 1, pins do
+			obj.draw(xs[i] - sx_off, ys[i] - sy_off, 0, size / point_base_size, alpha)
+		end
+	end
+	draw_points(pin_sx, pin_sy, 0x20e060, edit_source)
+	draw_points(pin_tx, pin_ty, 0xf05050, not edit_source)
+	if #arrow_heads >= 4 and obj.load("figure", "三角形", 0xff4c14, 16) then
+		obj.drawpoly(arrow_heads, 4, 0.90)
+	end
+	obj.ox, obj.oy, obj.oz, obj.cx, obj.cy, obj.cz,
+	obj.rx, obj.ry, obj.rz, obj.sx, obj.sy, obj.sz, obj.alpha = unpack(saved_props)
 end
 
 -- =============================================================
@@ -1950,3 +2031,13 @@ obj.pixelshader("psmain", "object", "tempbuffer")
 obj.cx = obj.cx - sx_off
 obj.cy = obj.cy - sy_off
 obj.setoption("focus_mode", "fixed_size")
+
+@パペットツール@ピン制御
+--information:パペットツール@ピン制御@WarpTool_F v0.0.1 by Fu-Majime
+--label:変形\WarpTool_F
+--track@index:番号,1,20,1,1
+--track@x:X,-4000,4000,0,0.01
+--track@y:Y,-4000,4000,0,0.01
+--trackgroup@x,y:XY
+
+obj.setanchor("x,y", 0, "line")

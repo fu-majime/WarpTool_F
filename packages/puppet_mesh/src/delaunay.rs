@@ -3,14 +3,13 @@
 /// Bowyer-Watson アルゴリズムで Delaunay 三角形分割を行い、
 /// その後制約エッジ（輪郭辺）を挿入する。
 /// 最後にα領域外の三角形を除去する。
-
 use std::collections::HashSet;
 
 const EPSILON: f64 = 1e-10;
 
 #[derive(Clone)]
 struct Triangle {
-    v: [usize; 3], // 頂点インデックス
+    v: [usize; 3],  // 頂点インデックス
     cc: (f64, f64), // 外接円中心
     cr2: f64,       // 外接円半径の2乗
 }
@@ -49,10 +48,18 @@ pub fn triangulate(
     let mut min_y = pts[0].1;
     let mut max_y = pts[0].1;
     for &(x, y) in &pts {
-        if x < min_x { min_x = x; }
-        if x > max_x { max_x = x; }
-        if y < min_y { min_y = y; }
-        if y > max_y { max_y = y; }
+        if x < min_x {
+            min_x = x;
+        }
+        if x > max_x {
+            max_x = x;
+        }
+        if y < min_y {
+            min_y = y;
+        }
+        if y > max_y {
+            max_y = y;
+        }
     }
 
     let dx = max_x - min_x;
@@ -100,9 +107,9 @@ pub fn triangulate(
             for edge_idx in 0..3 {
                 let e = (tri.v[edge_idx], tri.v[(edge_idx + 1) % 3]);
                 // 他の「悪い」三角形と共有されていないエッジのみ
-                let shared = bad_tris.iter().any(|&oi| {
-                    oi != bi && triangle_has_edge(&triangles[oi], e.0, e.1)
-                });
+                let shared = bad_tris
+                    .iter()
+                    .any(|&oi| oi != bi && triangle_has_edge(&triangles[oi], e.0, e.1));
                 if !shared {
                     polygon.push(e);
                 }
@@ -127,9 +134,7 @@ pub fn triangulate(
     }
 
     // スーパー三角形の頂点を含む三角形を除去
-    triangles.retain(|tri| {
-        tri.v[0] < n && tri.v[1] < n && tri.v[2] < n
-    });
+    triangles.retain(|tri| tri.v[0] < n && tri.v[1] < n && tri.v[2] < n);
 
     // 制約エッジの挿入
     if !contour_edges.is_empty() {
@@ -144,9 +149,7 @@ pub fn triangulate(
                 continue;
             }
             // エッジが既に存在するかチェック
-            let exists = triangles.iter().any(|tri| {
-                triangle_has_edge(tri, ca, cb)
-            });
+            let exists = triangles.iter().any(|tri| triangle_has_edge(tri, ca, cb));
 
             if !exists {
                 // エッジフリップで制約エッジを挿入する
@@ -221,12 +224,7 @@ fn triangle_has_edge(tri: &Triangle, a: usize, b: usize) -> bool {
 
 /// 制約エッジを挿入する。
 /// 交差する三角形のエッジをフリップして制約エッジを確立する。
-fn insert_constraint_edge(
-    triangles: &mut Vec<Triangle>,
-    pts: &[(f64, f64)],
-    ca: usize,
-    cb: usize,
-) {
+fn insert_constraint_edge(triangles: &mut Vec<Triangle>, pts: &[(f64, f64)], ca: usize, cb: usize) {
     // 簡易実装: 制約エッジと交差するDelaunayエッジを見つけてフリップ
     // 複雑なケースでは失敗する可能性があるが、通常の輪郭には十分
 
@@ -254,16 +252,16 @@ fn insert_constraint_edge(
                     // 隣接三角形を探す
                     let mut adj_idx = None;
                     let mut adj_opp = 0;
-                    for k in 0..triangles.len() {
+                    for (k, triangle) in triangles.iter().enumerate() {
                         if k == i {
                             continue;
                         }
-                        if triangle_has_edge(&triangles[k], ea, eb) {
+                        if triangle_has_edge(triangle, ea, eb) {
                             adj_idx = Some(k);
                             // 対向頂点を見つける
                             for m in 0..3 {
-                                if triangles[k].v[m] != ea && triangles[k].v[m] != eb {
-                                    adj_opp = triangles[k].v[m];
+                                if triangle.v[m] != ea && triangle.v[m] != eb {
+                                    adj_opp = triangle.v[m];
                                     break;
                                 }
                             }
@@ -323,12 +321,7 @@ fn insert_constraint_edge(
 }
 
 /// 2つの線分が交差するかを判定する（端点共有は除く）
-fn segments_intersect(
-    a1: (f64, f64),
-    a2: (f64, f64),
-    b1: (f64, f64),
-    b2: (f64, f64),
-) -> bool {
+fn segments_intersect(a1: (f64, f64), a2: (f64, f64), b1: (f64, f64), b2: (f64, f64)) -> bool {
     let d1 = cross2d(b1, b2, a1);
     let d2 = cross2d(b1, b2, a2);
     let d3 = cross2d(a1, a2, b1);
@@ -354,12 +347,7 @@ mod tests {
     #[test]
     fn test_triangulate_square() {
         // 正方形の4頂点
-        let points = vec![
-            (-5.0f32, -5.0),
-            (5.0, -5.0),
-            (5.0, 5.0),
-            (-5.0, 5.0),
-        ];
+        let points = vec![(-5.0f32, -5.0), (5.0, -5.0), (5.0, 5.0), (-5.0, 5.0)];
         let w = 20;
         let h = 20;
         let alpha = vec![255u8; w * h];
