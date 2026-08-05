@@ -1,3 +1,3 @@
 # WaveTool_F
 
-[ダウンロード](https://github.com/sigma-axis/aviutl2_script_Basic_S/releases)
+[ダウンロード](https://github.com/fu-majime/WarpTool_F/releases)
