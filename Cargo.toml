@@ -1,9 +1,13 @@
 [workspace]
-members = ["packages/puppet_mesh"]
+members = [
+    "packages/puppet_geometry",
+    "packages/puppet_tool_aux",
+    "packages/script_edit_bridge",
+]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.0.2"
 edition = "2024"
 license = "MIT"
 authors = ["Fumajime"]

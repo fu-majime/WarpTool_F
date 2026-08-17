@@ -17,7 +17,9 @@ use aviutl2::{
     sys::module2::SCRIPT_MODULE_PARAM,
 };
 
+mod arap;
 mod contour;
+mod deformation;
 mod delaunay;
 mod dilate;
 mod poisson;
@@ -28,9 +30,9 @@ const MIN_DENSITY: i32 = 5;
 const MAX_DENSITY: i32 = 200;
 
 #[aviutl2::plugin(ScriptModule)]
-struct PuppetMeshModule;
+struct PuppetGeometryModule;
 
-impl aviutl2::module::ScriptModule for PuppetMeshModule {
+impl aviutl2::module::ScriptModule for PuppetGeometryModule {
     fn new(_info: aviutl2::AviUtl2Info) -> AnyResult<Self> {
         Ok(Self)
     }
@@ -38,7 +40,7 @@ impl aviutl2::module::ScriptModule for PuppetMeshModule {
     fn plugin_info(&self) -> aviutl2::module::ScriptModuleTable {
         aviutl2::module::ScriptModuleTable {
             information: format!(
-                "Puppet mesh generator for AviUtl2 / v{} / Fu-Majime",
+                "Puppet geometry engine for AviUtl2 / v{} / Fu-Majime",
                 env!("CARGO_PKG_VERSION")
             ),
             functions: Self::functions(),
@@ -46,16 +48,101 @@ impl aviutl2::module::ScriptModule for PuppetMeshModule {
     }
 }
 
-impl ScriptModuleFunctions for PuppetMeshModule {
+impl ScriptModuleFunctions for PuppetGeometryModule {
     fn functions() -> Vec<ModuleFunction> {
-        vec![ModuleFunction {
-            name: "generate".to_owned(),
-            func: generate_callback,
-        }]
+        vec![
+            ModuleFunction {
+                name: "generate".to_owned(),
+                func: generate_callback,
+            },
+            ModuleFunction {
+                name: "deform_mls".to_owned(),
+                func: deform_callback,
+            },
+            ModuleFunction {
+                name: "deform_arap".to_owned(),
+                func: deform_arap_callback,
+            },
+        ]
     }
 }
 
-aviutl2::register_script_module!(PuppetMeshModule);
+extern "C" fn deform_arap_callback(raw: *mut SCRIPT_MODULE_PARAM) {
+    let result = catch_unwind(AssertUnwindSafe(|| deform_callback_inner(raw, true)));
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => set_callback_error(raw, &error.to_string()),
+        Err(_) => set_callback_error(raw, "internal panic in deform_arap"),
+    }
+}
+
+extern "C" fn deform_callback(raw: *mut SCRIPT_MODULE_PARAM) {
+    let result = catch_unwind(AssertUnwindSafe(|| deform_callback_inner(raw, false)));
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => set_callback_error(raw, &error.to_string()),
+        Err(_) => set_callback_error(raw, "internal panic in deform_mls"),
+    }
+}
+
+fn deform_callback_inner(raw: *mut SCRIPT_MODULE_PARAM, arap: bool) -> AnyResult<()> {
+    anyhow::ensure!(!raw.is_null(), "AviUtl2 passed a null module-call handle");
+    // SAFETY: the host owns the call table for the duration of this callback.
+    let mut params = unsafe { ScriptModuleCallHandle::from_raw(raw) };
+    let floats = |index| {
+        (0..params.get_param_array_len(index))
+            .map(|i| params.get_param_array_float(index, i))
+            .collect::<Vec<_>>()
+    };
+    let ints = |index| {
+        (0..params.get_param_array_len(index))
+            .map(|i| params.get_param_array_int(index, i))
+            .collect::<Vec<_>>()
+    };
+    let vertices = floats(0);
+    let indices = ints(1);
+    let sources = floats(2);
+    let destinations = floats(3);
+    let layers = floats(4);
+    let divisions = params
+        .get_param_int(6)
+        .context("invalid subdivision count")?;
+    let width = params.get_param_float(7).context("invalid width")?;
+    let height = params.get_param_float(8).context("invalid height")?;
+    let deformation = if arap {
+        deformation::deform_arap(
+            &vertices,
+            &indices,
+            &sources,
+            &destinations,
+            &layers,
+            divisions,
+            width,
+            height,
+        )?
+    } else {
+        deformation::deform_mls(
+            &vertices,
+            &indices,
+            &sources,
+            &destinations,
+            &layers,
+            params.get_param_float(5).context("invalid stiffness")?,
+            divisions,
+            width,
+            height,
+        )?
+    };
+    params
+        .push_result_array_float(&deformation.vertices)
+        .context("failed to return deformed vertices")?;
+    params
+        .push_result_array_float(&deformation.render_vertices)
+        .context("failed to return render vertices")?;
+    Ok(())
+}
+
+aviutl2::register_script_module!(PuppetGeometryModule);
 
 /// AviUtl2 exposes the value returned by `obj.getpixeldata()` as Lua
 /// `Userdata`. aviutl2-rs 0.42's typed pointer conversion only accepts

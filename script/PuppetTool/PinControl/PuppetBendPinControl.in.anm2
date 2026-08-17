@@ -1,0 +1,111 @@
+--information:${EFFECT_NAME}@${PACKAGE_NAME} v${PACKAGE_VERSION} by ${AUTHOR}
+--label:${SCRIPT_LABEL}
+---$track:番号, min = 1, max = 20, step = 1
+local index = 1
+---$track:回転, min = -3600, max = 3600, step = 0.01
+local rot = 0
+---$track:拡大率, min = 0, max = 10000, step = 0.01
+local scale = 100
+---$check:アンカーで制御
+local use_anchor = false
+---$value:アンカー制御
+local anchor = {}
+
+if use_anchor then
+    obj.setanchor("anchor", 1, "small")
+end
+
+local function parse_numbers(value)
+    local numbers = {}
+    if type(value) == "table" then
+        for i = 1, #value do
+            numbers[i] = tonumber(value[i])
+        end
+    elseif type(value) == "string" then
+        for token in value:gmatch("[^,%{%}%s]+") do
+            numbers[#numbers + 1] = tonumber(token)
+        end
+    end
+    return numbers
+end
+
+local function get_current_effect_index()
+    local script_name = obj.getoption("script_name")
+    local effect_index = 0
+
+    for relative = -1, -64, -1 do
+        local ok, upper_script_name = pcall(function()
+            return obj.getoption("script_name", relative, false)
+        end)
+        if ok and upper_script_name == script_name then
+            effect_index = effect_index + 1
+        end
+    end
+
+    return script_name, effect_index
+end
+
+if obj.getoption("gui") then
+    local script_name, effect_index = get_current_effect_index()
+    local state_key = "puppet_bend_anchor_state:" .. script_name .. ":" .. tostring(effect_index)
+    local state = global[state_key]
+    if type(state) ~= "string" then
+        state = use_anchor and "1" or "0"
+        global[state_key] = state
+    end
+
+    if not use_anchor then
+        global[state_key] = "0"
+    else
+        local pin_index = math.floor(index)
+        local ok_src, src = pcall(function()
+            return obj.getvalue("パペットツール@${PACKAGE_NAME}:0", "ピン元")
+        end)
+        local offset = pin_index * 2
+        local anchor_values = parse_numbers(anchor)
+        local src_values = parse_numbers(src)
+        local anchor_x, anchor_y = anchor_values[1], anchor_values[2]
+        local pin_x, pin_y = src_values[offset - 1], src_values[offset]
+
+        if ok_src and pin_x and pin_y then
+            local pending_x, pending_y = state:match("^p,([^,]+),([^,]+)$")
+            pending_x = tonumber(pending_x)
+            pending_y = tonumber(pending_y)
+
+            if state == "0" then
+                local radians = math.rad(rot)
+                local target_x = pin_x - math.cos(radians) * scale
+                local target_y = pin_y - math.sin(radians) * scale
+                pending_x = math.floor(target_x * 100 + 0.5) / 100
+                pending_y = math.floor(target_y * 100 + 0.5) / 100
+                global[state_key] = string.format("p,%.2f,%.2f", pending_x, pending_y)
+            end
+
+            local ok, bridge = pcall(function() return obj.module("ScriptEditBridge") end)
+            if ok and type(bridge) == "table" and type(bridge.request) == "function" then
+                local pending = pending_x ~= nil and pending_y ~= nil
+                if pending and anchor_x and anchor_y
+                    and math.abs(anchor_x - pending_x) < 0.005
+                    and math.abs(anchor_y - pending_y) < 0.005 then
+                    global[state_key] = "1"
+                    pending = false
+                end
+
+                if pending then
+                    local anchor_text = string.format("%.2f,%.2f", pending_x, pending_y)
+                    pcall(bridge.request, script_name, effect_index, "アンカー制御", anchor_text)
+                elseif anchor_x and anchor_y then
+                    local dx = pin_x - anchor_x
+                    local dy = pin_y - anchor_y
+                    local next_rot = math.floor(math.deg(math.atan2(dy, dx)) * 100 + 0.5) / 100
+                    local next_scale = math.floor(math.sqrt(dx * dx + dy * dy) * 100 + 0.5) / 100
+                    if math.abs(rot - next_rot) >= 0.005 then
+                        pcall(bridge.request, script_name, effect_index, "回転", tostring(next_rot))
+                    elseif math.abs(scale - next_scale) >= 0.005 then
+                        pcall(bridge.request, script_name, effect_index, "拡大率", tostring(next_scale))
+                    end
+                end
+            end
+        end
+    end
+end

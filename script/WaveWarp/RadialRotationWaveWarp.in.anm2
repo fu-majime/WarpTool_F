@@ -1,0 +1,97 @@
+--information:${EFFECT_NAME}@${PACKAGE_NAME} v${PACKAGE_VERSION} by ${AUTHOR}
+--label:${SCRIPT_LABEL}
+--group:基本設定,true
+---$value:中心
+local center = {0,0}
+---$select:波形
+---サイン=1
+---矩形=2
+---三角形=3
+---のこぎり(正)=4
+---のこぎり(負)=5
+---円形=6
+---半円形(正)=7
+---半円形(負)=8
+local shape = 1
+---$track:周期[s], min = -1000, max = 1000, step = 0.01
+local period = 8
+--group:放射波,true
+---$track:放射振幅[px], min = 0, max = 4000
+local radAmp = 100
+---$track:放射周波数[回], min = 0, max = 1000, step = 0.01
+local radFreq = 8
+---$track:放射位相[度], min = -3600, max = 3600
+local radPhase = 0
+--group:回転波,true
+---$track:回転振幅[度], min = -3600, max = 3600
+local rotAmp = 90
+---$track:回転半径[px], min = 0, max = 4000
+local rotRadius = 100
+---$track:回転位相[度], min = -3600, max = 3600
+local rotPhase = 0
+--group:螺旋,false
+---$track:螺旋ねじれ, min = -2, max = 2, step = 0.01
+local spiralMix = 0
+--group:その他,false
+---$check:デバッグモード
+local debug = 0
+---$value:PI
+local PI = {}
+
+obj.setanchor("center", 1);
+local WaveWarpGeometry = require "WaveWarpGeometry"
+
+--[[pixelshader@psmain:
+---$include "RadialRotationWaveWarp.hlsl"
+]]
+
+-- メイン処理
+local function main()
+    local rad_phase_normalized = ((tonumber(PI.radPhase) or radPhase) or 0) / 360
+    
+    local current_rad_amp = tonumber(PI.radAmp) or radAmp
+    
+    if type(PI.center) == "table" then
+        local cx, cy = tonumber(PI.center[1]), tonumber(PI.center[2]);
+        if cx and cy then center = { cx, cy } end
+    end
+    
+    local orig_w, orig_h = obj.getpixel()
+    local expansionSize = math.abs(current_rad_amp)
+    obj.effect("領域拡張", "上", expansionSize, "下", expansionSize, 
+               "右", expansionSize, "左", expansionSize)
+    obj.cx = obj.cx + (expansionSize - expansionSize) * 0.5
+    obj.cy = obj.cy + (expansionSize - expansionSize) * 0.5
+    
+    local w, h = obj.getpixel()
+    
+    local originalCenterX = expansionSize + orig_w * 0.5 + center[1]
+    local originalCenterY = expansionSize + orig_h * 0.5 + center[2]
+
+    local rot_amp_normalized = ((tonumber(PI.rotAmp) or rotAmp) or 0) / 360
+    local rot_phase_normalized = ((tonumber(PI.rotPhase) or rotPhase) or 0) / 360
+
+    local shaderParams = {
+        w, h,
+        orig_w, orig_h,
+        center[1], center[2],
+        originalCenterX, originalCenterY,
+        obj.time,
+        tonumber(PI.period) or period,
+        current_rad_amp,
+        tonumber(PI.radFreq) or radFreq,
+        tonumber(PI.shape) or shape or 1,
+        rad_phase_normalized,
+        tonumber(PI.spiralMix) or spiralMix,
+        rot_amp_normalized,
+        tonumber(PI.rotRadius) or rotRadius,
+        rot_phase_normalized,
+        tonumber(PI.debug) or debug,
+        tonumber(PI.debug_A) or debug_A,
+        tonumber(PI.debug_B) or debug_B,
+    }
+    
+    obj.pixelshader("psmain", "object", {"object"}, shaderParams, "copy")
+end
+
+main()

@@ -1,0 +1,207 @@
+--information:${EFFECT_NAME}@${PACKAGE_NAME} v${PACKAGE_VERSION} by ${AUTHOR}
+--label:${SCRIPT_LABEL}
+---$track:変形率, min = 0, max = 100
+local ratio = 100
+---$track:横格子点, min = 2, max = 20, step = 1
+local posw = 5
+---$track:縦格子点, min = 2, max = 20, step = 1
+local posh = 5
+--group:詳細設定,false
+---$track:分割数, min = 1, max = 256, step = 1
+local div = 50
+---$track:滑らか度, min = 0, max = 100
+local smooth = 100
+---$value:座標
+local pos = {}
+--filter
+
+-- RGBA加算合成でα値が1.0を超えた場合に調整するPixelShader
+--[[pixelshader@psmain:
+---$include "MeshDeformation.hlsl"
+]]
+
+-- 標準座標のテーブルを作成
+local init={}
+for y=0,posh-1 do
+	for x=0,posw-1 do
+		table.insert(init,obj.w*(x/(posw-1)-0.5))
+		table.insert(init,obj.h*(y/(posh-1)-0.5))
+	end
+end
+-- 座標の数が異なる場合は標準座標にする
+if (#pos ~= #init) then
+	pos = init
+end
+
+-- アンカーを設定する
+local num = posw*posh
+obj.setanchor("pos",num,init,"small","mesh",posw,posh,"rgba",0xffffff40)
+
+-- 変形率を反映した座標にする
+if (ratio < 100) then
+	for i=1,#pos do
+		pos[i] = init[i] + (pos[i]-init[i])*ratio/100
+	end
+end
+
+-- Catmull-Romスプライン補間（1次元）
+-- t: 0～1 の補間パラメータ, p0,p1,p2,p3: 4つの制御点
+local function catmull_rom(t, p0, p1, p2, p3)
+	local t2 = t * t
+	local t3 = t2 * t
+	return 0.5 * ((2*p1) + (-p0+p2)*t + (2*p0-5*p1+4*p2-p3)*t2 + (-p0+3*p1-3*p2+p3)*t3)
+end
+
+-- 格子点の座標を取得（線形外挿で境界外に対応）
+-- gx: 0～posw-1, gy: 0～posh-1 の格子インデックス
+-- 戻り値: x座標, y座標
+local function grid_get(gx, gy)
+	-- 線形外挿: 境界外は 2*境界点-隣接点 で自然な接線を保つ
+	-- （Catmull-Romの標準的な自然境界条件）
+	if gx < 0 or gx > posw-1 or gy < 0 or gy > posh-1 then
+		local cgx = math.max(0, math.min(posw-1, gx))
+		local cgy = math.max(0, math.min(posh-1, gy))
+		local idx = (cgx + cgy * posw) * 2
+		local bx, by = pos[idx+1], pos[idx+2]
+		-- 隣接する内側の点を求めて外挿
+		local igx = cgx + (gx < 0 and 1 or (gx > posw-1 and -1 or 0))
+		local igy = cgy + (gy < 0 and 1 or (gy > posh-1 and -1 or 0))
+		igx = math.max(0, math.min(posw-1, igx))
+		igy = math.max(0, math.min(posh-1, igy))
+		local iidx = (igx + igy * posw) * 2
+		local nx, ny = pos[iidx+1], pos[iidx+2]
+		return 2*bx - nx, 2*by - ny
+	end
+	local idx = (gx + gy * posw) * 2
+	return pos[idx+1], pos[idx+2]
+end
+
+-- Bicubic Catmull-Romサンプリング
+-- 格子セル(cell_x, cell_y)内の位置(fx, fy) (0～1)での補間座標を返す
+-- smooth_factor: 0=線形, 1=完全Catmull-Rom（呼び出し元でsmooth/100から渡す）
+local function bicubic_sample(cell_x, cell_y, fx, fy, smooth_factor)
+	-- 線形補間（bilinear）の結果
+	local lx0, ly0 = grid_get(cell_x,   cell_y)
+	local lx1, ly1 = grid_get(cell_x+1, cell_y)
+	local lx2, ly2 = grid_get(cell_x+1, cell_y+1)
+	local lx3, ly3 = grid_get(cell_x,   cell_y+1)
+	local top_x  = lx0 + (lx1 - lx0) * fx
+	local top_y  = ly0 + (ly1 - ly0) * fx
+	local bot_x  = lx3 + (lx2 - lx3) * fx
+	local bot_y  = ly3 + (ly2 - ly3) * fx
+	local lin_x  = top_x + (bot_x - top_x) * fy
+	local lin_y  = top_y + (bot_y - top_y) * fy
+
+	if smooth_factor <= 0 then
+		return lin_x, lin_y
+	end
+
+	-- Catmull-Romで行方向に4行分それぞれ補間
+	local row_x = {}
+	local row_y = {}
+	for j = -1, 2 do
+		local gy = cell_y + j
+		local p0x, p0y = grid_get(cell_x-1, gy)
+		local p1x, p1y = grid_get(cell_x,   gy)
+		local p2x, p2y = grid_get(cell_x+1, gy)
+		local p3x, p3y = grid_get(cell_x+2, gy)
+		row_x[j+2] = catmull_rom(fx, p0x, p1x, p2x, p3x)
+		row_y[j+2] = catmull_rom(fx, p0y, p1y, p2y, p3y)
+	end
+	-- 列方向に補間
+	local cr_x = catmull_rom(fy, row_x[1], row_x[2], row_x[3], row_x[4])
+	local cr_y = catmull_rom(fy, row_y[1], row_y[2], row_y[3], row_y[4])
+
+	-- 線形とCatmull-Romをブレンド
+	if smooth_factor >= 1 then
+		return cr_x, cr_y
+	end
+	return lin_x + (cr_x - lin_x) * smooth_factor,
+	       lin_y + (cr_y - lin_y) * smooth_factor
+end
+
+-- 仮想バッファの解像度を決める
+local w,h=obj.getpixel()
+local dstw,dsth=w,h
+local sx=0
+local ex=0
+local sy=0
+local ey=0
+if (obj.getinfo("filter")) then
+	obj.setoption("drawtarget","tempbuffer",dstw,dsth)
+else
+	for i=0,num-1 do
+		sx = math.min(sx,pos[i*2+1])
+		ex = math.max(ex,pos[i*2+1])
+		sy = math.min(sy,pos[i*2+2])
+		ey = math.max(ey,pos[i*2+2])
+	end
+	-- Catmull-Romはオーバーシュートする場合があるのでマージンを追加
+	if (smooth > 0) then
+		local margin_x = (ex - sx) * 0.1 * smooth / 100
+		local margin_y = (ey - sy) * 0.1 * smooth / 100
+		sx = sx - margin_x
+		ex = ex + margin_x
+		sy = sy - margin_y
+		ey = ey + margin_y
+	end
+	dstw = math.ceil(ex-sx)
+	dsth = math.ceil(ey-sy)
+	obj.setoption("drawtarget","tempbuffer",dstw,dsth)
+	sx = (sx+ex)/2
+	sy = (sy+ey)/2
+end
+
+-- 変形させて描画する
+local vertex={}
+local divw = math.ceil(div/posw)
+local divh = math.ceil(div/posh)
+local sf = smooth / 100  -- smooth_factor: 0～1
+for posy=0,posh-2 do
+	for posx=0,posw-2 do
+		-- 各サブ頂点をbicubicサンプリングで算出
+		v1 = h*posy/(posh-1)
+		local prev_row = {}  -- 前の行の頂点座標を保持
+		for xi=0,divw do
+			local fx = xi / divw
+			local bx, by = bicubic_sample(posx, posy, fx, 0, sf)
+			prev_row[xi] = { bx - sx, by - sy }
+		end
+		for yi=1,divh do
+			local fy = yi / divh
+			local curr_row = {}
+			for xi=0,divw do
+				local fx = xi / divw
+				local bx, by = bicubic_sample(posx, posy, fx, fy, sf)
+				curr_row[xi] = { bx - sx, by - sy }
+			end
+			v0 = v1
+			v1 = h*(posy+fy)/(posh-1)
+			u1 = w*posx/(posw-1)
+			for xi=1,divw do
+				local fx = xi / divw
+				u0 = u1
+				u1 = w*(posx+fx)/(posw-1)
+				x0 = prev_row[xi-1][1]
+				y0 = prev_row[xi-1][2]
+				x1 = prev_row[xi][1]
+				y1 = prev_row[xi][2]
+				x2 = curr_row[xi][1]
+				y2 = curr_row[xi][2]
+				x3 = curr_row[xi-1][1]
+				y3 = curr_row[xi-1][2]
+				table.insert(vertex,{x0,y0,0,x1,y1,0,x2,y2,0,x3,y3,0 ,u0,v0,u1,v0,u1,v1,u0,v1})
+			end
+			prev_row = curr_row
+		end
+	end
+end
+obj.setoption("blend","rgba_add")
+obj.drawpoly(vertex);
+
+-- α値を調整してオブジェクトにコピーする
+obj.clearbuffer("object",dstw,dsth)
+obj.pixelshader("psmain","object","tempbuffer")
+obj.cx = obj.cx-sx
+obj.cy = obj.cy-sy
+obj.setoption("focus_mode","fixed_size")

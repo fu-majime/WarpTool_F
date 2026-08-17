@@ -1,0 +1,134 @@
+--information:${EFFECT_NAME}@${PACKAGE_NAME} v${PACKAGE_VERSION} by ${AUTHOR}
+--label:${SCRIPT_LABEL}
+--group:基本設定,true
+---$value:波形配置
+local waveLayout = {0,-100,0,0,100,0}
+---$track:周期[s], min = -10, max = 10, step = 0.01
+local period = 1
+---$track:位相[度], min = -3600, max = 3600
+local phase = 0
+
+---$include "DirectionWaveWarpCommonUI.inc.lua"
+
+obj.setanchor("waveLayout", 3, "line")
+local WaveWarpGeometry = require "WaveWarpGeometry"
+
+
+-- ローカル関数定義
+local function createRotationMatrix(angle)
+    local cos_a = math.cos(angle)
+    local sin_a = math.sin(angle)
+    return { cos_a, -sin_a, sin_a, cos_a }
+end
+
+local function distancePointToLine(x1, y1, x2, y2, px, py)
+    local dx = x2 - x1
+    local dy = y2 - y1
+    local line_length = math.sqrt(dx * dx + dy * dy)
+    
+    if line_length == 0 then
+        -- 2点が同じ場合は点間の距離
+        return math.sqrt((px - x1) * (px - x1) + (py - y1) * (py - y1))
+    end
+    
+    -- 点と直線の距離の公式: |ax + by + c| / sqrt(a^2 + b^2)
+    -- 直線の方程式: dy * x - dx * y + (dx * y1 - dy * x1) = 0
+    local a = dy
+    local b = -dx
+    local c = dx * y1 - dy * x1
+    
+    return math.abs(a * px + b * py + c) / line_length
+end
+
+-- メイン処理
+local function main()
+    -- パラメータの初期化（PIパラメータインジェクション対応）
+    local X, Y = waveLayout[1], waveLayout[2]
+    local center = { waveLayout[3], waveLayout[4] }
+    if type(PI.waveLayout) == "table" then
+        X, Y = tonumber(PI.waveLayout[1]) or waveLayout[1], tonumber(PI.waveLayout[2]) or waveLayout[2]
+        local cx, cy = tonumber(PI.waveLayout[3]), tonumber(PI.waveLayout[4]);
+        if cx and cy then
+            center = { cx, cy };
+        end
+        waveLayout[5] = tonumber(PI.waveLayout[5]) or waveLayout[5]
+        waveLayout[6] = tonumber(PI.waveLayout[6]) or waveLayout[6]
+    end
+	
+    local height = math.sqrt((X - center[1]) * (X - center[1]) + (Y - center[2]) * (Y - center[2]))
+    local width = distancePointToLine(center[1], center[2], X, Y, waveLayout[5], waveLayout[6])
+    local rot = math.deg(math.atan2(Y - center[2], X - center[1])) + 90
+
+    local rot_rad = (tonumber(PI.rot) or rot) / 180 * math.pi
+    local phase_normalized = ((tonumber(PI.phase) or phase) or 0) / 360
+    
+    -- ゼロ値チェック（PIパラメータインジェクション対応）
+    local current_height = tonumber(PI.height) or height
+    local current_width = tonumber(PI.width) or width
+    if current_height == 0 or current_width == 0 then
+        return
+    end
+    
+    -- 領域拡張前の解像度を取得
+    local orig_w, orig_h = obj.getpixel()
+
+    -- 領域拡張の計算と適用
+    mirror = tonumber(PI.mirror) or mirror
+    local expansionParams = WaveWarpGeometry.calculateExpansionParams(current_height, rot_rad, tonumber(PI.fix) or fix, mirror, center, orig_w, orig_h)
+    obj.effect("領域拡張", "上", expansionParams[1], "下", expansionParams[2], 
+               "右", expansionParams[3], "左", expansionParams[4])
+    obj.cx = obj.cx + (expansionParams[4] - expansionParams[3]) * 0.5
+    obj.cy = obj.cy + (expansionParams[1] - expansionParams[2]) * 0.5
+
+    -- ピクセルサイズ取得
+    local w, h = obj.getpixel()
+    local rotMatrix = createRotationMatrix(rot_rad)
+    
+    -- 鏡面反射用の元画像中心座標を計算（ピクセル単位）
+    local topExpansion, bottomExpansion, rightExpansion, leftExpansion = 
+        expansionParams[1], expansionParams[2], expansionParams[3], expansionParams[4]
+    local originalCenterX = leftExpansion + orig_w * 0.5 + center[1]
+    local originalCenterY = topExpansion + orig_h * 0.5 + center[2]
+    
+    -- シード値の計算 (AviUtlのobj.randを利用)
+    local user_seed = tonumber(PI.randSeed) or randSeed
+    -- フレーム0固定でシードを生成（時間経過で波の形が変わらないようにするため）
+    local shader_seed = obj.rand(0, 2147483647, user_seed, 0)
+    
+    -- シェーダーパラメータの構築（PIパラメータインジェクション対応）
+    local shaderParams = {
+        -- 解像度（領域拡張後）
+        w, h,
+        -- 元の解像度（領域拡張前）
+        orig_w, orig_h,
+        center[1], center[2],
+        originalCenterX, originalCenterY,
+        -- 時間s
+        obj.time,
+        -- エフェクトパラメータ
+        current_height,
+        current_width,
+        rot_rad,
+        -- 回転行列 (正方向)
+        rotMatrix[1], rotMatrix[2], rotMatrix[3], rotMatrix[4],
+        -- 回転行列 (逆方向)
+        rotMatrix[1], -rotMatrix[2], -rotMatrix[3], rotMatrix[4],
+        -- その他パラメータ
+        tonumber(PI.period) or period,
+        tonumber(PI.shape) or shape or 1,
+        phase_normalized,
+        mirror,
+        tonumber(PI.fix) or fix,
+        tonumber(PI.fadePixel) or fadePixel,
+        tonumber(PI.randHeight) or randHeight,
+        tonumber(PI.randWidth) or randWidth or 0,
+        shader_seed,
+        tonumber(PI.debug) or debug,
+    }
+    
+    -- シェーダー適用
+    obj.pixelshader("psmain@方向波形ワープ(パラメータ)@WarpTool_F", "object", {"object"}, shaderParams, "copy")
+end
+
+-- メイン処理実行
+main()

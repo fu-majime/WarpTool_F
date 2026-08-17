@@ -1,0 +1,73 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/karoterra/aviutl2-aulua/refs/heads/main/schema/aulua.schema.json
+project:
+  variables:
+    AUTHOR: Fu-Majime
+    SCRIPT_LABEL: '変形\WarpTool_F'
+
+package:
+  name: WarpTool_F
+  version: 0.0.2
+
+build:
+  out_dir: target\lua
+
+install:
+  out_dir: C:\ProgramData\aviutl2\Script
+
+scripts:
+  - name: "@WarpTool_F.anm2"
+    sources:
+      - path: script/WaveWarp/DirectionWaveWarpParameters.in.anm2
+        label: 方向波形ワープ(パラメータ)
+        variables:
+          EFFECT_NAME: 方向波形ワープ(パラメータ)
+      - path: script/WaveWarp/DirectionWaveWarpLayout.in.anm2
+        label: 方向波形ワープ(配置)
+        variables:
+          EFFECT_NAME: 方向波形ワープ(配置)
+      - path: script/WaveWarp/RadialRotationWaveWarp.in.anm2
+        label: 放射回転波形ワープ(没)
+        variables:
+          EFFECT_NAME: 放射回転波形ワープ(パラメータ)
+      - path: script/MeshDeformation.in.anm2
+        label: メッシュ変形
+        variables:
+          EFFECT_NAME: メッシュ変形
+      - path: script/PuppetTool/PuppetTool.in.anm2
+        label: パペットツール
+        variables:
+          EFFECT_NAME: パペットツール
+          EFFECT_NAME_position_pin: パペットツール@位置ピン制御
+          EFFECT_NAME_bone_pin: パペットツール@ボーンピン制御
+          EFFECT_NAME_bend_pin: パペットツール@ベンドピン制御
+          EFFECT_NAME_advanced_pin: パペットツール@詳細ピン制御
+          EFFECT_NAME_overlap_pin: パペットツール@重なりピン制御
+      - path: script/PuppetTool/PinControl/PuppetPositionPinControl.in.anm2
+        label: パペットツール@位置ピン制御
+        variables:
+          EFFECT_NAME: パペットツール@位置ピン制御
+          SCRIPT_LABEL: '変形\WarpTool_F\パペットピン制御'
+      - path: script/PuppetTool/PinControl/PuppetBonePinControl.in.anm2
+        label: パペットツール@ボーンピン制御
+        variables:
+          EFFECT_NAME: パペットツール@ボーンピン制御
+          SCRIPT_LABEL: '変形\WarpTool_F\パペットピン制御'
+      - path: script/PuppetTool/PinControl/PuppetBendPinControl.in.anm2
+        label: パペットツール@ベンドピン制御
+        variables:
+          EFFECT_NAME: パペットツール@ベンドピン制御
+          SCRIPT_LABEL: '変形\WarpTool_F\パペットピン制御'
+      - path: script/PuppetTool/PinControl/PuppetAdvancedPinControl.in.anm2
+        label: パペットツール@詳細ピン制御
+        variables:
+          EFFECT_NAME: パペットツール@詳細ピン制御
+          SCRIPT_LABEL: '変形\WarpTool_F\パペットピン制御'
+      - path: script/PuppetTool/PinControl/PuppetOverlapPinControl.in.anm2
+        label: パペットツール@重なりピン制御
+        variables:
+          EFFECT_NAME: パペットツール@重なりピン制御
+          SCRIPT_LABEL: '変形\WarpTool_F\パペットピン制御'
+
+  - name: WaveWarpGeometry.lua
+    sources:
+      - path: script/WaveWarp/WaveWarpGeometry.lua
