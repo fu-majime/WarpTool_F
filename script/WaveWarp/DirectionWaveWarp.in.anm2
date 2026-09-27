@@ -1,0 +1,313 @@
+--information:${EFFECT_NAME}@${PACKAGE_NAME} v${PACKAGE_VERSION} by ${AUTHOR}
+--label:${SCRIPT_LABEL}
+--group:基本設定,true
+---$track:高さ, min = 0, max = 4000
+local height = 100
+---$track:幅, min = 0, max = 4000
+local width = 100
+---$track:回転[度], min = -3600, max = 3600
+local rot = 0
+---$track:周期[s], min = -10, max = 10, step = 0.01
+local period = 1
+---$track:位相[度], min = -3600, max = 3600
+local phase = 0
+---$value:中心
+local center = {0,0}
+---$check:アンカーで制御
+local use_anchor = false
+---$value:アンカー制御
+local waveLayout = {0,-100,0,0,100,0}
+
+-- 方向波形ワープ共通UI
+--group:波形,true
+---$select:波形
+---サイン=1
+---矩形=2
+---三角形=3
+---のこぎり(正)=4
+---のこぎり(負)=5
+---円形=6
+---半円形(正)=7
+---半円形(負)=8
+local shape = 1
+
+---$check:鏡面反射
+local mirror = 0
+
+--group:ランダム,false
+---$track:高さランダム[%], min = 0, max = 100
+local randHeight = 0
+---$track:幅ランダム[%], min = 0, max = 100
+local randWidth = 0
+---$track:ランダムシード, min = -65536, max = 65535, step = 1
+local randSeed = 0
+
+--group:その他,false
+---$select:固定処理
+---なし=1
+---すべて=2
+---上下=3
+---左右=4
+---上=5
+---下=6
+---左=7
+---右=8
+local fix = 1
+
+---$track:フェード幅[px], min = 0, max = 1000
+local fadePixel = 20
+---$value:PI
+local PI = {}
+
+-- チェックは boolean、PI は boolean と 0/1 の両方を受け付ける。
+if PI.use_anchor ~= nil then
+    use_anchor = PI.use_anchor == true
+        or (tonumber(PI.use_anchor) or 0) ~= 0
+end
+
+if use_anchor then
+    obj.setanchor("waveLayout", 3, "line")
+else
+    obj.setanchor("center", 1)
+end
+local WaveWarpGeometry = require "WaveWarpGeometry"
+
+--[[pixelshader@psmain:
+---$include "DirectionWaveWarp.hlsl"
+]]
+
+-- アンカーから求めた値は描画に使い、OFFへ切り替えた時だけUIへ保存する。
+local function parameters_from_layout(layout)
+    local dx, dy = layout[1] - layout[3], layout[2] - layout[4]
+    local h = math.sqrt(dx * dx + dy * dy)
+    local wx, wy = layout[5] - layout[3], layout[6] - layout[4]
+    local w = h == 0 and math.sqrt(wx * wx + wy * wy)
+        or math.abs(dx * wy - dy * wx) / h
+    local r = h == 0 and rot or math.deg(math.atan2(dy, dx)) + 90
+    r = r + 360 * math.floor((rot - r) / 360 + 0.5)
+    return {h, w, r, layout[3], layout[4]}
+end
+
+local function encode_values(values)
+    local text = {}
+    for i = 1, #values do text[i] = string.format("%.6f", values[i]) end
+    return table.concat(text, ",")
+end
+
+local function decode_values(text)
+    local values = {}
+    for value in text:gmatch("[^,]+") do values[#values + 1] = tonumber(value) end
+    return values
+end
+
+local function sync_controls()
+    if not obj.getoption("gui") or PI.use_anchor ~= nil then return end
+    local script_name = obj.getoption("script_name")
+    local effect_index = 0
+    for relative = -1, -64, -1 do
+        local ok, name = pcall(function()
+            return obj.getoption("script_name", relative, false)
+        end)
+        if ok and name == script_name then effect_index = effect_index + 1 end
+    end
+    -- 以前の連続同期の状態とは別キーを使用する。
+    local key = "direction_wave_anchor_commit:" .. script_name .. ":" .. tostring(effect_index)
+    local state = global[key]
+    if use_anchor then
+        -- OFF→ON時だけ数値から配置を作り、受理済みの要求は再送しない。
+        if state == "0" or (type(state) == "string" and state:match("^%d,")) then
+            local values = state == "0" and {height, width, rot, center[1], center[2]}
+                or decode_values(state:sub(3))
+            local s, c = math.sin(math.rad(values[3])), math.cos(math.rad(values[3]))
+            state = "l," .. encode_values({
+                values[4] + values[1] * s, values[5] - values[1] * c,
+                values[4], values[5],
+                values[4] + values[2] * c, values[5] + values[2] * s,
+            })
+            global[key] = state
+        end
+        if type(state) == "string" and (state:sub(1, 2) == "l," or state:sub(1, 2) == "w,") then
+            local payload = state:sub(3)
+            local layout = decode_values(payload)
+            local matched = true
+            for i = 1, 6 do
+                if math.abs(waveLayout[i] - layout[i]) >= 0.00001 then matched = false end
+            end
+            if not matched then
+                if state:sub(1, 2) == "l," then
+                    local ok, bridge = pcall(function() return obj.module("ScriptEditBridge") end)
+                    if ok and type(bridge) == "table" and type(bridge.request) == "function" then
+                        global[key] = "w," .. payload
+                        local called, accepted = pcall(bridge.request, script_name, effect_index, "波形配置", payload)
+                        if not called or not accepted then global[key] = state end
+                    else
+                        global[key] = "a," .. encode_values(parameters_from_layout(waveLayout))
+                        return
+                    end
+                end
+                -- 非同期反映を待つ間も新しい配置で描画する。
+                return nil, layout
+            end
+        end
+        -- 通常のON中は最後の配置を記憶するだけ。
+        global[key] = "a," .. encode_values(parameters_from_layout(waveLayout))
+        return
+    end
+    if type(state) ~= "string" or state == "0" then
+        global[key] = "0"
+        return
+    end
+    if state:sub(1, 2) == "l," or state:sub(1, 2) == "w," then
+        state = "a," .. encode_values(parameters_from_layout(decode_values(state:sub(3))))
+    end
+    if state:sub(1, 2) == "a," then
+        local values = decode_values(state:sub(3))
+        local function track_value(value, minimum, maximum)
+            return math.max(minimum, math.min(maximum, math.floor(value * 100 + 0.5) / 100))
+        end
+        values[1] = track_value(values[1], 0, 4000)
+        values[2] = track_value(values[2], 0, 4000)
+        values[3] = track_value(values[3], -3600, 3600)
+        state = "1," .. encode_values(values)
+        global[key] = state
+    end
+    local stage, payload = state:match("^(%d),(.+)$")
+    stage = tonumber(stage)
+    if not stage then return end
+    local values = decode_values(payload)
+    local labels = {"高さ", "幅", "回転[度]", "中心"}
+    local current = {height, width, rot}
+    while stage <= 4 do
+        local changed
+        if stage == 4 then
+            changed = math.abs(center[1] - values[4]) >= 0.00001
+                or math.abs(center[2] - values[5]) >= 0.00001
+        else
+            changed = math.abs(current[stage] - values[stage]) >= 0.005
+        end
+        local next_state = stage == 4 and "0" or tostring(stage + 1) .. "," .. payload
+        if changed then
+            local ok, bridge = pcall(function() return obj.module("ScriptEditBridge") end)
+            if not ok or type(bridge) ~= "table" or type(bridge.request) ~= "function" then
+                global[key] = "0"
+                return
+            end
+            local value = stage == 4 and encode_values({values[4], values[5]}) or tostring(values[stage])
+            -- 受付済みの項目は再送しない。表示値との比較による無限再描画を防ぐ。
+            global[key] = next_state
+            local called, accepted = pcall(bridge.request, script_name, effect_index, labels[stage], value)
+            if not called or not accepted then global[key] = tostring(stage) .. "," .. payload end
+            return values
+        end
+        global[key] = next_state
+        stage = stage + 1
+    end
+end
+
+local function main()
+    local committed, pending_layout = sync_controls()
+    if committed then
+        height, width, rot = committed[1], committed[2], committed[3]
+        center = {committed[4], committed[5]}
+    end
+    -- 配置モードでは3点からパラメータを求める。UIのテーブルは変更しない。
+    if use_anchor then
+        local layout = {}
+        local injected = type(PI.waveLayout) == "table" and PI.waveLayout or {}
+        for i = 1, 6 do
+            layout[i] = tonumber(injected[i]) or (pending_layout or waveLayout)[i]
+        end
+        local dx, dy = layout[1] - layout[3], layout[2] - layout[4]
+        height = math.sqrt(dx * dx + dy * dy)
+        center = {layout[3], layout[4]}
+        local wx, wy = layout[5] - center[1], layout[6] - center[2]
+        if height == 0 then
+            width = math.sqrt(wx * wx + wy * wy)
+        else
+            width = math.abs(dx * wy - dy * wx) / height
+        end
+        rot = math.deg(math.atan2(dy, dx)) + 90
+    end
+
+    -- 両モードともPIの個別パラメータを最優先にする。
+    local rot_rad = (tonumber(PI.rot) or rot) / 180 * math.pi
+    local phase_normalized = ((tonumber(PI.phase) or phase) or 0) / 360
+    
+    -- ゼロ値チェック（PIパラメータインジェクション対応）
+    local current_height = tonumber(PI.height) or height
+    local current_width = tonumber(PI.width) or width
+    if current_height == 0 or current_width == 0 then
+        return
+    end
+
+    if type(PI.center) == "table" then
+        local cx, cy = tonumber(PI.center[1]), tonumber(PI.center[2]);
+        if cx and cy then
+            center = { cx, cy };
+        end
+    end
+    
+    -- 領域拡張前の解像度を取得
+    local orig_w, orig_h = obj.getpixel()
+
+    -- 領域拡張の計算と適用
+    mirror = tonumber(PI.mirror) or mirror
+    local expansionParams = WaveWarpGeometry.calculateExpansionParams(current_height, rot_rad, tonumber(PI.fix) or fix, mirror, center, orig_w, orig_h)
+    obj.effect("領域拡張", "上", expansionParams[1], "下", expansionParams[2], 
+               "右", expansionParams[3], "左", expansionParams[4])
+    obj.cx = obj.cx + (expansionParams[4] - expansionParams[3]) * 0.5
+    obj.cy = obj.cy + (expansionParams[1] - expansionParams[2]) * 0.5
+
+    -- ピクセルサイズ取得
+    local w, h = obj.getpixel()
+    
+    local rotMatrix = WaveWarpGeometry.createRotationMatrix(rot_rad)
+    
+    -- 鏡面反射用の元画像中心座標を計算（ピクセル単位）
+    local topExpansion, bottomExpansion, rightExpansion, leftExpansion = 
+        expansionParams[1], expansionParams[2], expansionParams[3], expansionParams[4]
+    local originalCenterX = leftExpansion + orig_w * 0.5 + center[1]
+    local originalCenterY = topExpansion + orig_h * 0.5 + center[2]
+    
+    -- シード値の計算 (AviUtlのobj.randを利用)
+    local user_seed = tonumber(PI.randSeed) or randSeed
+    -- フレーム0固定でシードを生成（時間経過で波の形が変わらないようにするため）
+    local shader_seed = obj.rand(0, 2147483647, user_seed, 0)
+    
+    -- シェーダーパラメータの構築（PIパラメータインジェクション対応）
+    local shaderParams = {
+        -- 解像度（領域拡張後）
+        w, h,
+        -- 元の解像度（領域拡張前）
+        orig_w, orig_h,
+        center[1], center[2],
+        originalCenterX, originalCenterY,
+        -- 時間s
+        obj.time,
+        -- エフェクトパラメータ
+        current_height,
+        current_width,
+        rot_rad,
+        -- 回転行列 (正方向)
+        rotMatrix[1], rotMatrix[2], rotMatrix[3], rotMatrix[4],
+        -- 回転行列 (逆方向)
+        rotMatrix[1], -rotMatrix[2], -rotMatrix[3], rotMatrix[4],
+        -- その他パラメータ
+        tonumber(PI.period) or period,
+        tonumber(PI.shape) or shape or 1,
+        phase_normalized,
+        mirror,
+        tonumber(PI.fix) or fix,
+        tonumber(PI.fadePixel) or fadePixel,
+        tonumber(PI.randHeight) or randHeight,
+        tonumber(PI.randWidth) or randWidth,
+        shader_seed,
+        tonumber(PI.debug) or 0,
+    }
+    
+    -- シェーダー適用
+    obj.pixelshader("psmain", "object", {"object"}, shaderParams, "copy")
+end
+
+-- メイン処理実行
+main()

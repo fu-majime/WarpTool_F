@@ -17,18 +17,18 @@ install:
 scripts:
   - name: "@WarpTool_F.anm2"
     sources:
-      - path: script/WaveWarp/DirectionWaveWarpParameters.in.anm2
-        label: 方向波形ワープ(パラメータ)
+      - path: script/WaveWarp/DirectionWaveWarp.in.anm2
+        label: 方向波形ワープ
         variables:
-          EFFECT_NAME: 方向波形ワープ(パラメータ)
-      - path: script/WaveWarp/DirectionWaveWarpLayout.in.anm2
-        label: 方向波形ワープ(配置)
+          EFFECT_NAME: 方向波形ワープ
+      - path: script/WaveWarp/RotationWaveWarp.in.anm2
+        label: 回転波形ワープ
         variables:
-          EFFECT_NAME: 方向波形ワープ(配置)
-      - path: script/WaveWarp/RadialRotationWaveWarp.in.anm2
-        label: 放射回転波形ワープ(没)
+          EFFECT_NAME: 回転波形ワープ
+      - path: script/WaveWarp/RadialWaveWarp.in.anm2
+        label: 放射波形ワープ
         variables:
-          EFFECT_NAME: 放射回転波形ワープ(パラメータ)
+          EFFECT_NAME: 放射波形ワープ
       - path: script/MeshDeformation.in.anm2
         label: メッシュ変形
         variables:

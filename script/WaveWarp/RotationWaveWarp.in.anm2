@@ -1,0 +1,56 @@
+--information:${EFFECT_NAME}@${PACKAGE_NAME} v${PACKAGE_VERSION} by ${AUTHOR}
+--label:${SCRIPT_LABEL}
+--group:基本設定,true
+---$value:中心
+local center = {0,0}
+---$select:波形
+---サイン=1
+---矩形=2
+---三角形=3
+---のこぎり(正)=4
+---のこぎり(負)=5
+---円形=6
+---半円形(正)=7
+---半円形(負)=8
+local shape = 1
+---$track:周期[s], min = -1000, max = 1000, step = 0.01
+local period = 8
+--group:回転波,true
+---$track:回転振幅[度], min = -3600, max = 3600
+local rotAmp = 90
+---$track:回転半径[px], min = 0, max = 4000
+local rotRadius = 100
+---$track:回転位相[度], min = -3600, max = 3600
+local rotPhase = 0
+--group:その他,false
+---$value:PI
+local PI = {}
+obj.setanchor("center", 1)
+--[[pixelshader@psmain:
+---$include "RotationWaveWarp.hlsl"
+]]
+local function main()
+    if type(PI.center) == "table" then
+        center = {tonumber(PI.center[1]) or center[1], tonumber(PI.center[2]) or center[2]}
+    end
+    local current_period = tonumber(PI.period) or period
+    local time_phase = current_period ~= 0 and obj.time / current_period or 0
+    local ow, oh = obj.getpixel()
+    local amplitude = math.rad(tonumber(PI.rotAmp) or rotAmp)
+    local radius = tonumber(PI.rotRadius) or rotRadius
+    if amplitude == 0 or radius <= 0 then return end
+    local phase = (tonumber(PI.rotPhase) or rotPhase) / 360 + time_phase
+    -- 四隅の回転軌跡と最大移動量から必要な拡張量を求める。
+    local ex, ey = ow * 0.5 + math.abs(center[1]), oh * 0.5 + math.abs(center[2])
+    local extent = math.sqrt(ex * ex + ey * ey)
+    local displacement = 2 * extent * math.sin(math.min(math.abs(amplitude), math.pi) * 0.5)
+    local pad_x = math.ceil(math.min(displacement, extent + math.abs(center[1]) - ow * 0.5))
+    local pad_y = math.ceil(math.min(displacement, extent + math.abs(center[2]) - oh * 0.5))
+    obj.effect("領域拡張", "上", pad_y, "下", pad_y, "右", pad_x, "左", pad_x)
+    local w, h = obj.getpixel()
+    obj.pixelshader("psmain", "object", {"object"}, {
+        w, h, pad_x + ow * 0.5 + center[1], pad_y + oh * 0.5 + center[2],
+        amplitude, 1 / radius, phase, tonumber(PI.shape) or shape,
+    }, "copy")
+end
+main()
