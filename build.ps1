@@ -46,7 +46,7 @@ try {
     $puppetEditorSource = Join-Path $repositoryRoot "target\$profile\puppet_tool_aux.dll"
     $puppetEditorDestination = Join-Path $pluginDirectory "WarpTool_F.aux2"
     $scriptSource = Join-Path $repositoryRoot "target\lua\@WarpTool_F.anm2"
-    $waveWarpSource = Join-Path $repositoryRoot "target\lua\WaveWarpGeometry.lua"
+    $waveWarpSource = Join-Path $repositoryRoot "target\lua\WaveWarpCommon.lua"
 
     Copy-Item -LiteralPath $moduleSource -Destination $moduleDestination -Force
     Copy-Item -LiteralPath $bridgeSource -Destination $bridgeDestination -Force

@@ -1,8 +1,22 @@
 --information:${EFFECT_NAME}@${PACKAGE_NAME} v${PACKAGE_VERSION} by ${AUTHOR}
 --label:${SCRIPT_LABEL}
 --group:基本設定,true
+---$track:高さ[px], min = 0, max = 4000, step = 0.01
+local height = 100
+---$track:周波数[回], min = 0, max = 1000, step = 0.01
+local frequency = 8
+---$track:周期[s], min = -1000, max = 1000, step = 0.01
+local period = 8
+---$track:位相[度], min = -3600, max = 3600, step = 0.01
+local phase = 0
 ---$value:中心
 local center = {0,0}
+---$check:アンカーで制御
+local use_anchor = false
+---$value:アンカー制御
+local waveLayout = {0,-150,0,0,38.268343,-92.387953}
+
+--group:波形,true
 ---$select:波形
 ---サイン=1
 ---矩形=2
@@ -13,55 +27,134 @@ local center = {0,0}
 ---半円形(正)=7
 ---半円形(負)=8
 local shape = 1
----$track:周期[s], min = -1000, max = 1000, step = 0.01
-local period = 8
---group:放射波,true
----$track:放射振幅[px], min = 0, max = 4000
-local radAmp = 100
----$track:放射周波数[回], min = 0, max = 1000, step = 0.01
-local radFreq = 8
----$track:放射位相[度], min = -3600, max = 3600
-local radPhase = 0
+---$track:基準位置[%], min = -100, max = 100
+local basePosition = 0
+
+--group:ランダム,false
+---$track:高さランダム[%], min = 0, max = 100
+local randHeight = 0
+---$track:幅ランダム[%], min = 0, max = 100
+local randWidth = 0
+---$track:ランダム周期[s], min = -1000, max = 1000, step = 0.01
+local randPeriod = 0
+---$track:ランダムシード, min = -65536, max = 65535, step = 1
+local randSeed = 0
+
 --group:その他,false
 ---$value:PI
 local PI = {}
-obj.setanchor("center", 1)
+if PI.use_anchor ~= nil then
+    use_anchor = PI.use_anchor == true or (tonumber(PI.use_anchor) or 0) ~= 0
+end
+if use_anchor then obj.setanchor("waveLayout", 3, "line")
+else obj.setanchor("center", 1) end
+local WaveWarpCommon = require "WaveWarpCommon"
+
 --[[pixelshader@psmain:
 ---$include "RadialWaveWarp.hlsl"
 ]]
+
+local function parameters_from_layout(layout, base_radius)
+    local outer_x, outer_y = layout[1] - layout[3], layout[2] - layout[4]
+    local inner_x, inner_y = layout[5] - layout[3], layout[6] - layout[4]
+    local outer = math.sqrt(outer_x * outer_x + outer_y * outer_y)
+    local inner = math.sqrt(inner_x * inner_x + inner_y * inner_y)
+    local high, low = math.max(outer, inner), math.min(outer, inner)
+    local amplitude = high - low
+    local reference = amplitude > 0
+        and (high + low - 2 * base_radius) / amplitude * 100 or basePosition
+    reference = math.max(-100, math.min(100, reference))
+    local wavePhase = outer == 0 and phase or -math.deg(math.atan2(outer_y, outer_x)) - 90
+    wavePhase = wavePhase + 360 * math.floor((phase - wavePhase) / 360 + 0.5)
+
+    local waveFrequency = frequency
+    if outer > 0 and inner > 0 then
+        local dot = outer_x * inner_x + outer_y * inner_y
+        local cross = outer_x * inner_y - outer_y * inner_x
+        local angle = math.deg(math.atan2(math.abs(cross), dot))
+        if angle > 0.000001 then waveFrequency = 180 / angle end
+    end
+    return {amplitude, waveFrequency, wavePhase, layout[3], layout[4], reference}
+end
+
+local function layout_from_parameters(values, base_radius)
+    local amplitude = math.max(0, values[1])
+    local reference = math.max(-100, math.min(100, values[6] or basePosition)) * 0.01
+    local outer = math.max(0, base_radius + amplitude * 0.5 * (reference + 1))
+    local inner = math.max(0, base_radius + amplitude * 0.5 * (reference - 1))
+    local phase = -math.rad(values[3])
+    local step = math.rad(values[2] > 0 and 180 / values[2] or 180)
+    return {
+        values[4] + outer * math.sin(phase), values[5] - outer * math.cos(phase),
+        values[4], values[5],
+        values[4] + inner * math.sin(phase + step), values[5] - inner * math.cos(phase + step),
+    }
+end
+
+local function sync_controls()
+    if not obj.getoption("gui") or PI.use_anchor ~= nil then return end
+    local w, h = obj.getpixel()
+    local base_radius = math.max(w, h) * 0.5
+    return WaveWarpCommon.syncControls(obj, global, {
+        key = "radialwavewarp_anchor:",
+        injected = PI.use_anchor ~= nil,
+        use_anchor = use_anchor,
+        layout = waveLayout,
+        values = {height, frequency, phase, center[1], center[2], basePosition},
+        items = {
+            {"高さ[px]", 1, 0, 4000},
+            {"周波数[回]", 2, 0, 1000},
+            {"位相[度]", 3, -3600, 3600},
+            {"中心", 4},
+            {"基準位置[%]", 6, -100, 100}
+        },
+        from_layout = function(layout) return parameters_from_layout(layout, base_radius) end,
+        to_layout = function(values) return layout_from_parameters(values, base_radius) end,
+    })
+end
+
 local function main()
+    local committed, pending_layout = sync_controls()
+    if committed then
+        height, frequency, phase = committed[1], committed[2], committed[3]
+        center = {committed[4], committed[5]}
+        basePosition = committed[6]
+    end
+    if use_anchor then
+        local layout = WaveWarpCommon.resolveLayout(pending_layout or waveLayout, PI.waveLayout)
+        local object_width, object_height = obj.getpixel()
+        local values = parameters_from_layout(layout, math.max(object_width, object_height) * 0.5)
+        height, frequency, phase = values[1], values[2], values[3]
+        center = {values[4], values[5]}
+        basePosition = values[6]
+    end
     if type(PI.center) == "table" then
         center = {tonumber(PI.center[1]) or center[1], tonumber(PI.center[2]) or center[2]}
     end
     local current_period = tonumber(PI.period) or period
     local time_phase = current_period ~= 0 and obj.time / current_period or 0
     local ow, oh = obj.getpixel()
-    local amplitude = tonumber(PI.radAmp) or radAmp
+    local amplitude = (tonumber(PI.height) or height) * 0.5
     if amplitude == 0 then return end
-    local frequency = tonumber(PI.radFreq) or radFreq
-    local phase = ((tonumber(PI.radPhase) or radPhase) / 360 + time_phase) * frequency
+    local waveFrequency = tonumber(PI.frequency) or frequency
+    local wavePhase = (tonumber(PI.phase) or phase) / 360 + time_phase
     local base_radius = math.max(ow, oh) * 0.5
     if base_radius <= 0 then return end
-    -- 元の放射輪郭の補間係数はピクセルごとではなくフレームごとに計算。
-    local n = math.max(1, math.abs(frequency))
-    local inner = math.max(base_radius - amplitude, 0.000001)
-    local outer = math.max(base_radius + amplitude, 0.000001)
-    local angle = math.pi / n
-    local tangent, straightness = 0, 0
-    if n > 1 then
-        tangent = (outer / inner - math.cos(angle)) / math.sin(angle)
-        local limit = base_radius * (1 - math.cos(angle)) / (1 + math.cos(angle))
-        straightness = math.min(math.abs(amplitude) / math.max(limit, 0.000001), 1)
-    end
-    local scale = math.abs(amplitude) / base_radius
+    local reference = math.max(-100, math.min(100, tonumber(PI.basePosition) or basePosition)) * 0.01
+    local scale = math.abs(amplitude) * (1 + reference) / base_radius
     local pad_x = math.ceil((ow * 0.5 + math.abs(center[1])) * scale)
     local pad_y = math.ceil((oh * 0.5 + math.abs(center[2])) * scale)
     obj.effect("領域拡張", "上", pad_y, "下", pad_y, "右", pad_x, "左", pad_x)
     local w, h = obj.getpixel()
+    local random_period = tonumber(PI.randPeriod) or randPeriod
+    local random_time = random_period ~= 0 and obj.time / random_period or 0
+    local shader_seed = obj.rand(0, 2147483647, tonumber(PI.randSeed) or randSeed, 0)
     obj.pixelshader("psmain", "object", {"object"}, {
         w, h, pad_x + ow * 0.5 + center[1], pad_y + oh * 0.5 + center[2],
-        base_radius, amplitude, frequency, phase,
-        tonumber(PI.shape) or shape, math.pi / (2 * n), tangent, straightness,
+        base_radius, amplitude, waveFrequency, wavePhase,
+        tonumber(PI.shape) or shape,
+        tonumber(PI.randHeight) or randHeight, tonumber(PI.randWidth) or randWidth, shader_seed,
+        reference, random_time,
     }, "copy")
 end
 main()

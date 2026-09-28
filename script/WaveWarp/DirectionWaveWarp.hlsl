@@ -22,6 +22,7 @@ cbuffer constant0 : register(b0) {
     float randWidth;
     float randSeed;
     float debug;
+    float randTime;
 };
 
 SamplerState s;
@@ -74,17 +75,16 @@ float2 calculateWarpedCoord(float2 texCoord, float2 rotatedCoord,
                             float wave, float height, float width, float rot, float2x2 rot2,
                             int waveMode, int fixType);
                             
-// 整数ハッシュ関数 (0.0 ~ 1.0 を返す)
-float hash1(int n) {
-    n += (int)randSeed;
-    n = (n << 13) ^ n;
-    return (float)((n * (n * n * 17389 + 611953) + 1611623773) & 0x7fffffff) / 2147483647.0;
+float animatedHash(int n, int a, int b, int c) {
+    int step = (int)floor(randTime);
+    int2 v = n + (int)randSeed + int2(step, step + 1) * 104729;
+    v = (v << 13) ^ v;
+    float2 values = (float2)((v * (v * v * a + b) + c) & 0x7fffffff) / 2147483647.0;
+    float t = frac(randTime);
+    return lerp(values.x, values.y, t * t * (3.0 - 2.0 * t));
 }
-float hash2(int n) {
-    n += (int)randSeed;
-    n = (n << 13) ^ n;
-    return (float)((n * (n * n * 27449 + 746773) + 1824261409) & 0x7fffffff) / 2147483647.0;
-}
+float hash1(int n) { return animatedHash(n, 17389, 611953, 1611623773); }
+float hash2(int n) { return animatedHash(n, 27449, 746773, 1824261409); }
 
 float4 psmain(float4 pos : SV_Position) : SV_Target {
     float2 texCoord = pos.xy / resolution;

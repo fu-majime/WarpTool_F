@@ -68,6 +68,6 @@ scripts:
           EFFECT_NAME: パペットツール@重なりピン制御
           SCRIPT_LABEL: '変形\WarpTool_F\パペットピン制御'
 
-  - name: WaveWarpGeometry.lua
+  - name: WaveWarpCommon.lua
     sources:
-      - path: script/WaveWarp/WaveWarpGeometry.lua
+      - path: script/WaveWarp/WaveWarpCommon.lua
