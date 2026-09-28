@@ -1,15 +1,10 @@
--- =============================================================
--- 2. メッシュ生成
--- =============================================================
--- mesh_x[], mesh_y[] = 全頂点座標
--- mesh_tris[] = {{ i1, i2, i3 }, ...}  (1-based index into mesh_x/y)
+-- メッシュ生成
 local mesh_x, mesh_y = {}, {}
 local mesh_tris = {}
 local mesh_n_verts = 0
 
--- AviUtl2スクリプトモジュールからLua配列としてメッシュを受け取る。
--- FFIポインタやRust側メモリの所有権をスクリプトへ持ち出さない。
 local function import_module_mesh(vertices, indices)
+	if type(vertices) == "table" and type(indices) == "table" and #vertices == 0 and #indices == 0 then return true end
 	if type(vertices) ~= "table" or type(indices) ~= "table" or
 		#vertices < 6 or #vertices % 2 ~= 0 or
 		#indices < 3 or #indices % 3 ~= 0 then
@@ -60,54 +55,6 @@ else
 	end
 end
 
-if module_error and not puppet_geometry_error_reported then
-	print("@warn", "puppet_geometry.mod2: " .. module_error .. " (格子メッシュを使用します)")
-	puppet_geometry_error_reported = true
-elseif generated then
-	puppet_geometry_error_reported = false
-end
-
-if not generated then
-	-- モジュールが無い、エラー、または空メッシュの場合の格子フォールバック。
-	mesh_x, mesh_y, mesh_tris = {}, {}, {}
-	local cell_size = math.max(w, h) / density
-	local cols = math.max(1, math.ceil(w / cell_size))
-	local rows = math.max(1, math.ceil(h / cell_size))
-	local cw = w / cols
-	local ch = h / rows
-
-	mesh_n_verts = (rows + 1) * (cols + 1)
-	for iy = 0, rows do
-		for ix = 0, cols do
-			local idx = iy * (cols + 1) + ix + 1
-			mesh_x[idx] = ix * cw - hw
-			mesh_y[idx] = iy * ch - hh
-		end
-	end
-
-	local function grid_idx(ix, iy)
-		return iy * (cols + 1) + ix + 1
-	end
-
-	for iy = 0, rows - 1 do
-		for ix = 0, cols - 1 do
-			local i0 = grid_idx(ix,     iy)
-			local i1 = grid_idx(ix + 1, iy)
-			local i2 = grid_idx(ix + 1, iy + 1)
-			local i3 = grid_idx(ix,     iy + 1)
-
-			if check_alpha_at((mesh_x[i0]+mesh_x[i1]+mesh_x[i2])/3, (mesh_y[i0]+mesh_y[i1]+mesh_y[i2])/3) or
-				check_alpha_at(mesh_x[i0], mesh_y[i0]) or
-				check_alpha_at(mesh_x[i1], mesh_y[i1]) or
-				check_alpha_at(mesh_x[i2], mesh_y[i2]) then
-				table.insert(mesh_tris, { i0, i1, i2 })
-			end
-			if check_alpha_at((mesh_x[i0]+mesh_x[i2]+mesh_x[i3])/3, (mesh_y[i0]+mesh_y[i2]+mesh_y[i3])/3) or
-				check_alpha_at(mesh_x[i0], mesh_y[i0]) or
-				check_alpha_at(mesh_x[i2], mesh_y[i2]) or
-				check_alpha_at(mesh_x[i3], mesh_y[i3]) then
-				table.insert(mesh_tris, { i0, i2, i3 })
-			end
-		end
-	end
+if module_error then
+	error("puppet_geometry.mod2: " .. module_error)
 end

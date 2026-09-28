@@ -1,7 +1,3 @@
--- =============================================================
--- 1. ピンのデフォルト位置（画像上に均等配置）
---    ユーザーがドラッグで関節等へ再配置する
--- =============================================================
 local function make_default_pin_pos(n)
 	local t = {}
 	if n <= 0 then
@@ -12,7 +8,6 @@ local function make_default_pin_pos(n)
 		t[1] = -hw * 0.3; t[2] = 0
 		t[3] =  hw * 0.3; t[4] = 0
 	else
-		-- 中央1点 + 残りを楕円上に分散配置
 		t[1] = 0; t[2] = 0
 		local rx = hw * 0.4
 		local ry = hh * 0.4
@@ -27,8 +22,6 @@ end
 
 local default_pins = make_default_pin_pos(pins)
 
--- 移動先を持つピンだけを、元のピンID順にピン先へ格納する。
--- ベンド・スターチ・重なりピンは移動先を持たない。
 local destination_pin_ids = {}
 local default_destinations = {}
 for pin_id = 1, pins do
@@ -66,7 +59,6 @@ elseif #dst ~= #default_destinations then
 	end
 end
 
--- アンカー設定: チェック中は変形元、チェックを外すと変形先を操作する TODO ピン制御時は使わないときもあるはず
 if show and pins > 0 then
     if edit_source then
         obj.setanchor("src", pins, default_pins, "rgba", 0x20e060e0)
@@ -131,7 +123,7 @@ while true do
 	if pin_id >= 1 and pin_id <= pins and pin_types[pin_id] == PIN_TYPE.BONE then
 		local ok_rot, rotation = pcall(function() return obj.getvalue(effect_name, "回転") end)
 		local ok_stretch, stretch = pcall(function() return obj.getvalue(effect_name, "伸縮") end)
-		local ok_apply, apply = pcall(function() return obj.getvalue(effect_name, "ピン先に反映") end)
+		local ok_apply, apply = pcall(function() return obj.getvalue(effect_name, "ピン移動先に反映") end)
 		if ok_rot and ok_stretch and tonumber(rotation) and tonumber(stretch) then
 			bone_overrides[pin_id] = {
 				rotation = tonumber(rotation), stretch = tonumber(stretch) / 100,
@@ -162,7 +154,6 @@ while true do
 	fx_idx = fx_idx + 1
 end
 
--- アンカーで指定した姿勢を解いた後、存在するボーン制御を優先して上書きする。
 local bone_anchor_x, bone_anchor_y = {}, {}
 local bone_target_x, bone_target_y, bone_write_control = {}, {}, {}
 local function parse_number_list(value)
@@ -207,8 +198,6 @@ if not edit_source and type(bone_forest) == "table" then
 	for slot, pin_id in ipairs(destination_pin_ids) do
 		full_dst[pin_id * 2 - 1], full_dst[pin_id * 2] = dst[slot * 2 - 1], dst[slot * 2]
 	end
-	-- 制御付きピンはアンカーを掴んだ瞬間だけ生じる座標も入力にしない。
-	-- 最後に確定したピン先を使い、子ボーンの局所角度への混入を防ぐ。
 	local last_controlled_dst = parse_number_list(global.puppet_bone_control_last)
 	if #last_controlled_dst == #dst then
 		for slot, pin_id in ipairs(destination_pin_ids) do
@@ -234,8 +223,6 @@ if not edit_source and type(bone_forest) == "table" then
 			global.puppet_bone_control_pending = ""
 			global.puppet_bone_control_pending_controls = ""
 		else
-			-- Bridge反映前の古いdstへ同じ制御差分を再適用しない。
-			-- 待機中は要求済みの姿勢全体を次の計算入力として固定する。
 			applied_controls = decode_bone_controls(global.puppet_bone_control_pending_controls)
 			for slot, pin_id in ipairs(destination_pin_ids) do
 				full_dst[pin_id * 2 - 1] = pending[slot * 2 - 1]
@@ -248,8 +235,6 @@ if not edit_source and type(bone_forest) == "table" then
 		src, full_dst, forest, pins,
 		has_bone_overrides and nil or global.puppet_bone_hierarchy_state, false)
 	if has_bone_overrides then
-		-- 制御後の保存座標はアンカー解決座標と一致しないため、
-		-- ソルバーの非同期待機フラグを持ち越さない。
 		global.puppet_bone_hierarchy_state = ""
 	else
 		global.puppet_bone_hierarchy_state = state
@@ -306,7 +291,6 @@ if not edit_source and type(bone_forest) == "table" then
 	for i = 1, #forest do pose(forest[i], nil, 0, 0, nil, false) end
 end
 
--- アンカー操作とボーン制御を反映した最終位置を「ピン先」へ保存する。
 if obj.getoption("gui") then
 	local solved_dst, changed = {}, false
 	for i = 1, #dst do solved_dst[i] = dst[i] end
@@ -333,7 +317,7 @@ if obj.getoption("gui") then
 		local ok, bridge = pcall(function() return obj.module("ScriptEditBridge") end)
 		if ok and type(bridge) == "table" and type(bridge.request) == "function" then
 			pcall(bridge.request, obj.getoption("script_name"), 0,
-				"ピン先", pin_hierarchy.encode(solved_dst))
+				"ピン移動先", pin_hierarchy.encode(solved_dst))
 		end
 	elseif type(global.puppet_bone_control_pending) ~= "string" then
 		global.puppet_bone_control_last = encode_number_list(solved_dst)
@@ -388,16 +372,4 @@ for i = 1, pins do
 		pin_dx[i] = pin_tx[i]
 		pin_dy[i] = pin_ty[i]
 	end
-end
-
--- =============================================================
--- ユーティリティ
--- =============================================================
-local function check_alpha_at(px_x, px_y)
-	local px = math.floor(px_x + hw)
-	local py = math.floor(px_y + hh)
-	px = math.max(0, math.min(w - 1, px))
-	py = math.max(0, math.min(h - 1, py))
-	local _, a = obj.getpixel(px, py, "col")
-	return a * 255 >= threshold
 end

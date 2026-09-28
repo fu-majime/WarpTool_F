@@ -6,7 +6,7 @@ project:
 
 package:
   name: WarpTool_F
-  version: 0.0.2
+  version: 0.0.3
 
 build:
   out_dir: target\lua

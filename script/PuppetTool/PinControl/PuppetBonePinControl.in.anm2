@@ -6,5 +6,5 @@ local index = 1
 local rot = 0
 ---$track:伸縮, min = 0, max = 10000, step = 0.01
 local stretch = 100
----$check:ピン先に反映
+---$check:ピン移動先に反映
 local apply_to_destination = false

@@ -1,7 +1,3 @@
--- Hierarchical pin solver.
---
--- This file does not access obj or global.  The including script owns the UI,
--- persistence, and application of the solved positions.
 local pin_hierarchy = {}
 
 local EPSILON = 0.1
@@ -39,8 +35,6 @@ local function normalize(angle)
     return angle
 end
 
--- Convert a nested forest into arrays. Invalid, duplicate, and cyclic
--- entries are ignored. Pins omitted from the forest become additional roots.
 local function compile_forest(value, count)
     local parent, children, order, seen = {}, {}, {}, {}
     for pin = 1, count do children[pin] = {} end
@@ -75,8 +69,6 @@ local function hierarchy_signature(parent, count)
     return signature
 end
 
--- State contains one local angle and one wait flag per pin. A signature
--- invalidates it when the pin count or forest changes.
 local function load_state(serialized, count, signature, parent, order, positions)
     local values = {}
     if type(serialized) == "string" then

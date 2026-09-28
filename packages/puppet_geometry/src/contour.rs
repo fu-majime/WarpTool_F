@@ -70,13 +70,61 @@ pub fn extract_contours(
 /// 事前に二値化済みのマップから Marching Squares で輪郭を抽出する。
 /// EDT膨張との組み合わせで使用。
 pub fn extract_contours_from_binary(binary: &[bool], w: usize, h: usize) -> Vec<Vec<Point>> {
-    if w < 2 || h < 2 {
-        return Vec::new();
+    // Enclose complete pixel cells, including single pixels and thin limbs.
+    let mut segments = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            if !binary[y * w + x] {
+                continue;
+            }
+            let (a, b, c, d) = (
+                (x as f32, y as f32),
+                ((x + 1) as f32, y as f32),
+                ((x + 1) as f32, (y + 1) as f32),
+                (x as f32, (y + 1) as f32),
+            );
+            if y == 0 || !binary[(y - 1) * w + x] {
+                segments.push((a, b));
+            }
+            if x + 1 == w || !binary[y * w + x + 1] {
+                segments.push((b, c));
+            }
+            if y + 1 == h || !binary[(y + 1) * w + x] {
+                segments.push((c, d));
+            }
+            if x == 0 || !binary[y * w + x - 1] {
+                segments.push((d, a));
+            }
+        }
     }
-    marching_squares(binary, w, h)
+    let chains = chain_segments(&segments, w as f32 * 0.5, h as f32 * 0.5);
+    let mut loops = Vec::new();
+    // Diagonally touching pixels can make a walk revisit a corner before
+    // returning to its start. Split at every repeated corner so simplification
+    // receives simple rings rather than a self-touching raster-sized polygon.
+    for chain in chains {
+        let mut path: Vec<Point> = Vec::new();
+        let mut positions = std::collections::HashMap::new();
+        for point in chain {
+            let key = (point.0.to_bits(), point.1.to_bits());
+            if let Some(&start) = positions.get(&key) {
+                let ring = path.split_off(start);
+                for p in &ring {
+                    positions.remove(&(p.0.to_bits(), p.1.to_bits()));
+                }
+                if ring.len() >= 3 {
+                    loops.push(ring);
+                }
+            }
+            positions.insert(key, path.len());
+            path.push(point);
+        }
+    }
+    loops
 }
 
 /// Marching Squares 実行（内部関数）
+#[cfg(test)]
 fn marching_squares(binary: &[bool], w: usize, h: usize) -> Vec<Vec<Point>> {
     let hw = w as f32 * 0.5;
     let hh = h as f32 * 0.5;
@@ -205,6 +253,40 @@ fn chain_segments(segments: &[Segment], hw: f32, hh: f32) -> Vec<Vec<Point>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn touching_pixel_rings_preserve_area_and_boundary() {
+        // Exhaust all 3x3 masks, including diagonal islands and a hole touching
+        // the exterior at a corner. No ring may revisit a vertex.
+        for mask in 0u32..512 {
+            let binary = (0..9).map(|i| mask & (1 << i) != 0).collect::<Vec<_>>();
+            let loops = extract_contours_from_binary(&binary, 3, 3);
+            let mut twice_area = 0.0;
+            let mut perimeter = 0;
+            for ring in loops {
+                let mut unique = std::collections::HashSet::new();
+                for (i, &p) in ring.iter().enumerate() {
+                    assert!(unique.insert((p.0.to_bits(), p.1.to_bits())), "mask {mask}");
+                    let q = ring[(i + 1) % ring.len()];
+                    twice_area += p.0 * q.1 - q.0 * p.1;
+                    assert_eq!((p.0 - q.0).abs() + (p.1 - q.1).abs(), 1.0);
+                    perimeter += 1;
+                }
+            }
+            assert_eq!(twice_area, 2.0 * mask.count_ones() as f32, "mask {mask}");
+            let expected_perimeter = (0..9)
+                .filter(|&i| binary[i])
+                .map(|i| {
+                    let (x, y) = (i % 3, i / 3);
+                    usize::from(x == 0 || !binary[i - 1])
+                        + usize::from(x == 2 || !binary[i + 1])
+                        + usize::from(y == 0 || !binary[i - 3])
+                        + usize::from(y == 2 || !binary[i + 3])
+                })
+                .sum::<usize>();
+            assert_eq!(perimeter, expected_perimeter, "mask {mask}");
+        }
+    }
 
     #[test]
     fn test_simple_square() {

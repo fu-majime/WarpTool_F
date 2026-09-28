@@ -11,3 +11,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 aviutl2 = { version = "0.42.0", default-features = false, features = ["filter", "generic", "module"] }
+spade = "2"
+
+[dev-dependencies]
+mlua = { version = "0.11", features = ["lua51", "vendored"] }

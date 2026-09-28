@@ -1,306 +1,129 @@
-//! Poisson Disk Sampling (Bridsonのアルゴリズム)
-//!
-//! 均一で自然なランダム点分布を生成する。
-//! 格子状にならないのが格子サンプリングとの最大の違い。
-
-/// Bridsonの高速Poisson Disk Sampling。
-///
-/// - `w`, `h`: サンプリング領域サイズ（ピクセル）
-/// - `min_dist`: 点間の最小距離
-/// - `alpha`: α画像データ (w*h), しきい値以上の領域にのみサンプリング
-/// - `threshold`: αしきい値
-/// - `contour_pts`: 輪郭上の点（これらとの距離も min_dist を保つ）
-/// - `seed`: 乱数シード
-///
-/// 戻り値: サンプリングされた内部点のリスト（画像中心原点）
+//! Deterministic variable-radius sampling, dense near boundaries and sparse
+//! in broad interiors. Scan candidates cover every disconnected component.
 pub fn poisson_disk_sample(
     w: usize,
     h: usize,
-    min_dist: f32,
+    base: f32,
     alpha: &[u8],
     threshold: u8,
-    contour_pts: &[(f32, f32)],
+    contour: &[(f32, f32)],
     seed: u64,
 ) -> Vec<(f32, f32)> {
-    let hw = w as f32 * 0.5;
-    let hh = h as f32 * 0.5;
-
-    // 加速グリッド
-    let cell_size = min_dist / std::f32::consts::SQRT_2;
-    let grid_w = (w as f32 / cell_size).ceil() as usize + 1;
-    let grid_h = (h as f32 / cell_size).ceil() as usize + 1;
-    let mut grid: Vec<Option<usize>> = vec![None; grid_w * grid_h];
-
-    // 結果リスト
-    let mut points: Vec<(f32, f32)> = Vec::new();
-    // アクティブリスト
-    let mut active: Vec<usize> = Vec::new();
-
-    let max_attempts = 30;
-    let min_dist2 = min_dist * min_dist;
-
-    // 簡易PRNG (xorshift64)
-    let mut rng_state = if seed == 0 { 0x12345678u64 } else { seed };
-    let mut next_rand = move || -> f64 {
-        rng_state ^= rng_state << 13;
-        rng_state ^= rng_state >> 7;
-        rng_state ^= rng_state << 17;
-        (rng_state as f64) / (u64::MAX as f64)
+    let base = base.max(1.0);
+    let mut depth = vec![0.0_f32; w * h];
+    for i in 0..w * h {
+        if alpha[i] >= threshold {
+            depth[i] = (w + h) as f32;
+        }
+    }
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            if x > 0 {
+                depth[i] = depth[i].min(depth[i - 1] + 1.0);
+            }
+            if y > 0 {
+                depth[i] = depth[i].min(depth[i - w] + 1.0);
+            }
+        }
+    }
+    for y in (0..h).rev() {
+        for x in (0..w).rev() {
+            let i = y * w + x;
+            if x + 1 < w {
+                depth[i] = depth[i].min(depth[i + 1] + 1.0);
+            }
+            if y + 1 < h {
+                depth[i] = depth[i].min(depth[i + w] + 1.0);
+            }
+        }
+    }
+    let cell = base * 0.5;
+    let gw = (w as f32 / cell).ceil() as usize + 1;
+    let gh = (h as f32 / cell).ceil() as usize + 1;
+    let mut grid = vec![Vec::<(f32, f32, f32)>::new(); gw * gh];
+    let (hw, hh) = (w as f32 * 0.5, h as f32 * 0.5);
+    for &(x, y) in contour {
+        let (x, y) = (x + hw, y + hh);
+        let (gx, gy) = ((x / cell) as usize, (y / cell) as usize);
+        if gx < gw && gy < gh {
+            grid[gy * gw + gx].push((x, y, 0.0));
+        }
+    }
+    let step = (base * 0.4).floor().max(1.0) as usize;
+    let mut candidates = Vec::new();
+    let mut random = seed.max(1);
+    let mut rand = || {
+        random ^= random << 13;
+        random ^= random >> 7;
+        random ^= random << 17;
+        random as f64 / u64::MAX as f64
     };
-
-    // 輪郭点をグリッドに登録
-    let mut all_pts: Vec<(f32, f32)> = Vec::new();
-    for &(cx, cy) in contour_pts {
-        // 画像座標に変換 (中心原点 → 左上原点)
-        let px = cx + hw;
-        let py = cy + hh;
-        if px >= 0.0 && px < w as f32 && py >= 0.0 && py < h as f32 {
-            let idx = all_pts.len();
-            all_pts.push((px, py));
-            let gx = (px / cell_size) as usize;
-            let gy = (py / cell_size) as usize;
-            if gx < grid_w && gy < grid_h {
-                grid[gy * grid_w + gx] = Some(idx);
-            }
-        }
-    }
-
-    // α領域内のランダムな初期点
-    let mut initial_found = false;
-    for _ in 0..1000 {
-        let px = next_rand() as f32 * w as f32;
-        let py = next_rand() as f32 * h as f32;
-        let ix = px as usize;
-        let iy = py as usize;
-        if ix < w && iy < h && alpha[iy * w + ix] >= threshold {
-            // 輪郭点との距離チェック
-            if is_valid_point(
-                px,
-                py,
-                &all_pts,
-                &grid,
-                (grid_w, grid_h),
-                cell_size,
-                min_dist2,
-            ) {
-                let idx = all_pts.len();
-                all_pts.push((px, py));
-                let gx = (px / cell_size) as usize;
-                let gy = (py / cell_size) as usize;
-                if gx < grid_w && gy < grid_h {
-                    grid[gy * grid_w + gx] = Some(idx);
-                }
-                points.push((px, py));
-                active.push(idx);
-                initial_found = true;
-                break;
-            }
-        }
-    }
-
-    if !initial_found {
-        // Small or disconnected opaque regions are easy to miss with random
-        // probes. Search deterministically instead of injecting the image
-        // centre, which may be fully transparent or inside a hole.
-        'find_seed: for y in 0..h {
-            for x in 0..w {
-                if alpha[y * w + x] < threshold {
-                    continue;
-                }
-
-                let px = x as f32 + 0.5;
-                let py = y as f32 + 0.5;
-                if !is_valid_point(
-                    px,
-                    py,
-                    &all_pts,
-                    &grid,
-                    (grid_w, grid_h),
-                    cell_size,
-                    min_dist2,
-                ) {
-                    continue;
-                }
-
-                let idx = all_pts.len();
-                all_pts.push((px, py));
-                let gx = (px / cell_size) as usize;
-                let gy = (py / cell_size) as usize;
-                grid[gy * grid_w + gx] = Some(idx);
-                points.push((px, py));
-                active.push(idx);
-                initial_found = true;
-                break 'find_seed;
-            }
-        }
-    }
-
-    if !initial_found {
-        return Vec::new();
-    }
-
-    // Bridsonのメインループ
-    while !active.is_empty() {
-        // ランダムなアクティブ点を選択
-        let active_idx = (next_rand() * active.len() as f64) as usize;
-        let active_idx = active_idx.min(active.len() - 1);
-        let pt_idx = active[active_idx];
-        let (bx, by) = all_pts[pt_idx];
-
-        let mut found = false;
-        for _ in 0..max_attempts {
-            // min_dist ～ 2*min_dist の環状領域にランダム点を生成
-            let angle = next_rand() as f32 * std::f32::consts::TAU;
-            let r = min_dist + next_rand() as f32 * min_dist;
-            let nx = bx + angle.cos() * r;
-            let ny = by + angle.sin() * r;
-
-            if nx < 0.0 || nx >= w as f32 || ny < 0.0 || ny >= h as f32 {
+    for y in (0..h).step_by(step) {
+        for x in (0..w).step_by(step) {
+            let px = (x as f64 + 0.5 + rand() * (step - 1) as f64) as f32;
+            let py = (y as f64 + 0.5 + rand() * (step - 1) as f64) as f32;
+            if px >= w as f32 || py >= h as f32 {
                 continue;
             }
-
-            let ix = nx as usize;
-            let iy = ny as usize;
-            if ix >= w || iy >= h || alpha[iy * w + ix] < threshold {
+            let i = py as usize * w + px as usize;
+            if alpha[i] < threshold {
                 continue;
             }
-
-            if is_valid_point(
-                nx,
-                ny,
-                &all_pts,
-                &grid,
-                (grid_w, grid_h),
-                cell_size,
-                min_dist2,
-            ) {
-                let new_idx = all_pts.len();
-                all_pts.push((nx, ny));
-                let gx = (nx / cell_size) as usize;
-                let gy = (ny / cell_size) as usize;
-                if gx < grid_w && gy < grid_h {
-                    grid[gy * grid_w + gx] = Some(new_idx);
-                }
-                points.push((nx, ny));
-                active.push(new_idx);
-                found = true;
-                break;
-            }
-        }
-
-        if !found {
-            active.swap_remove(active_idx);
+            let radius = base * (1.0 + (depth[i] / base).min(1.0));
+            candidates.push((px, py, radius));
         }
     }
-
-    // 座標を画像中心原点に変換
-    points.iter().map(|&(x, y)| (x - hw, y - hh)).collect()
-}
-
-fn is_valid_point(
-    x: f32,
-    y: f32,
-    all_pts: &[(f32, f32)],
-    grid: &[Option<usize>],
-    grid_size: (usize, usize),
-    cell_size: f32,
-    min_dist2: f32,
-) -> bool {
-    let (grid_w, grid_h) = grid_size;
-    let gx = (x / cell_size) as i32;
-    let gy = (y / cell_size) as i32;
-
-    // 近傍セルをチェック（5×5）
-    for dy in -2..=2 {
-        for dx in -2..=2 {
-            let nx = gx + dx;
-            let ny = gy + dy;
-            if nx >= 0
-                && nx < grid_w as i32
-                && ny >= 0
-                && ny < grid_h as i32
-                && let Some(idx) = grid[(ny as usize) * grid_w + (nx as usize)]
-            {
-                let (px, py) = all_pts[idx];
-                let ddx = x - px;
-                let ddy = y - py;
-                if ddx * ddx + ddy * ddy < min_dist2 {
-                    return false;
+    candidates.sort_by(|a, b| a.2.total_cmp(&b.2));
+    let mut result = Vec::new();
+    for (x, y, radius) in candidates {
+        let (gx, gy) = ((x / cell) as usize, (y / cell) as usize);
+        let mut valid = true;
+        'neighbors: for yy in gy.saturating_sub(4)..=(gy + 4).min(gh - 1) {
+            for xx in gx.saturating_sub(4)..=(gx + 4).min(gw - 1) {
+                for &(px, py, pr) in &grid[yy * gw + xx] {
+                    let spacing = if pr == 0.0 {
+                        radius * 0.5
+                    } else {
+                        radius.max(pr)
+                    };
+                    if (x - px).powi(2) + (y - py).powi(2) < spacing * spacing {
+                        valid = false;
+                        break 'neighbors;
+                    }
                 }
             }
         }
+        if valid {
+            grid[gy * gw + gx].push((x, y, radius));
+            result.push((x - hw, y - hh));
+        }
     }
-    true
+    result
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn test_poisson_basic() {
-        let w = 100;
-        let h = 100;
-        let alpha = vec![255u8; w * h];
-        let min_dist = 10.0;
-        let points = poisson_disk_sample(w, h, min_dist, &alpha, 128, &[], 42);
-        assert!(!points.is_empty(), "点が生成されるべき");
-
-        // すべての点間距離がmin_dist以上であることを確認
-        let min_dist2 = min_dist * min_dist * 0.95; // 少しマージン
-        for i in 0..points.len() {
-            for j in (i + 1)..points.len() {
-                let dx = points[i].0 - points[j].0;
-                let dy = points[i].1 - points[j].1;
-                let d2 = dx * dx + dy * dy;
-                assert!(
-                    d2 >= min_dist2,
-                    "点{:?}と{:?}が近すぎる: dist={}",
-                    points[i],
-                    points[j],
-                    d2.sqrt()
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_poisson_alpha_region() {
-        // 左半分のみ不透明
-        let w = 100;
-        let h = 100;
-        let mut alpha = vec![0u8; w * h];
-        for y in 0..h {
-            for x in 0..w / 2 {
+    fn samples_all_islands_and_stays_inside() {
+        let (w, h) = (160, 80);
+        let mut alpha = vec![0; w * h];
+        for y in 5..75 {
+            for x in 5..65 {
                 alpha[y * w + x] = 255;
+                alpha[y * w + x + 90] = 255;
             }
         }
-        let points = poisson_disk_sample(w, h, 10.0, &alpha, 128, &[], 42);
-        for &(px, _) in &points {
-            // 中心原点なので左半分は px < 0
-            assert!(px < 1.0, "右半分(透明領域)に点がある: x={}", px);
+        let p = poisson_disk_sample(w, h, 8.0, &alpha, 1, &[], 42);
+        assert!(p.iter().any(|p| p.0 < 0.0) && p.iter().any(|p| p.0 > 0.0));
+        for &(x, y) in &p {
+            assert_eq!(alpha[(y + 40.0) as usize * w + (x + 80.0) as usize], 255);
         }
+        assert!(p.len() < 160);
+        assert_eq!(p, poisson_disk_sample(w, h, 8.0, &alpha, 1, &[], 42));
     }
-
     #[test]
-    fn test_poisson_empty_region_returns_no_points() {
-        let alpha = vec![0u8; 32 * 32];
-        let points = poisson_disk_sample(32, 32, 10.0, &alpha, 128, &[], 42);
-        assert!(points.is_empty());
-    }
-
-    #[test]
-    fn test_poisson_tiny_region_does_not_fall_back_to_transparent_center() {
-        let w = 100;
-        let h = 100;
-        let mut alpha = vec![0u8; w * h];
-        alpha[3 * w + 2] = 255;
-
-        let points = poisson_disk_sample(w, h, 10.0, &alpha, 128, &[], 1);
-        for &(x, y) in &points {
-            let image_x = (x + w as f32 * 0.5) as usize;
-            let image_y = (y + h as f32 * 0.5) as usize;
-            assert!(alpha[image_y * w + image_x] >= 128);
-        }
+    fn empty_has_no_samples() {
+        assert!(poisson_disk_sample(16, 16, 2.0, &[0; 256], 1, &[], 1).is_empty());
     }
 }

@@ -130,15 +130,11 @@ impl aviutl2::generic::GenericPlugin for PuppetToolAux {
     }
 
     fn event_change_focus_object(&mut self) {
-        let _ = self
-            .sender
-            .send(WorkerCommand::SelectFocused { effect_index: 0 });
+        let _ = self.sender.send(WorkerCommand::SelectFocused);
     }
 
     fn on_project_load(&mut self, _project: &mut aviutl2::generic::ProjectFile) {
-        let _ = self
-            .sender
-            .send(WorkerCommand::SelectFocused { effect_index: 0 });
+        let _ = self.sender.send(WorkerCommand::SelectFocused);
     }
 }
 

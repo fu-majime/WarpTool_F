@@ -1,13 +1,14 @@
-use std::{cmp::Ordering, collections::BinaryHeap};
+use std::{cmp::Reverse, collections::BinaryHeap};
 
 use aviutl2::anyhow::{self, Context as _};
 
 const EPSILON: f64 = 1.0e-10;
 
-#[derive(Clone, Copy, Debug)]
-struct Point {
-    x: f64,
-    y: f64,
+use crate::{math::Point, mls::RigidMls};
+
+pub(crate) enum Method {
+    RigidMls(f64),
+    Arap,
 }
 
 #[derive(Clone, Copy)]
@@ -17,39 +18,16 @@ struct Sample {
     layer: f64,
 }
 
-#[derive(Clone, Copy)]
-struct QueueEntry {
-    distance: f64,
-    vertex: usize,
-}
-
-impl Eq for QueueEntry {}
-impl PartialEq for QueueEntry {
-    fn eq(&self, other: &Self) -> bool {
-        self.distance == other.distance && self.vertex == other.vertex
-    }
-}
-impl Ord for QueueEntry {
-    fn cmp(&self, other: &Self) -> Ordering {
-        other
-            .distance
-            .total_cmp(&self.distance)
-            .then_with(|| other.vertex.cmp(&self.vertex))
-    }
-}
-impl PartialOrd for QueueEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
 pub(crate) struct Deformation {
     pub vertices: Vec<f64>,
     /// Triangle-list vertices, four values per vertex: x, y, u, v.
     pub render_vertices: Vec<f64>,
+    /// Original mesh edges sampled through the same field as the renderer.
+    pub wire_vertices: Vec<f64>,
 }
 
 #[allow(clippy::too_many_arguments)] // Mirrors the flat AviUtl2 module ABI.
+#[cfg(test)]
 pub(crate) fn deform_mls(
     vertices: &[f64],
     indices: &[i32],
@@ -61,191 +39,22 @@ pub(crate) fn deform_mls(
     width: f64,
     height: f64,
 ) -> anyhow::Result<Deformation> {
-    anyhow::ensure!(
-        vertices.len() >= 6 && vertices.len().is_multiple_of(2),
-        "invalid vertices"
-    );
-    anyhow::ensure!(
-        indices.len() >= 3 && indices.len().is_multiple_of(3),
-        "invalid indices"
-    );
-    anyhow::ensure!(pin_source.len().is_multiple_of(2), "invalid source pins");
-    anyhow::ensure!(
-        pin_destination.len() == pin_source.len(),
-        "pin arrays differ in length"
-    );
-    let pin_count = pin_source.len() / 2;
-    anyhow::ensure!(
-        pin_layers.len() == pin_count || pin_layers.len() == pin_count * 2,
-        "invalid pin layers"
-    );
-    let (pin_layers, pin_ranges) = if pin_layers.len() == pin_count * 2 {
-        pin_layers.split_at(pin_count)
-    } else {
-        (pin_layers, &[][..])
-    };
-    anyhow::ensure!(
-        width > 0.0 && height > 0.0,
-        "image dimensions must be positive"
-    );
-    anyhow::ensure!(
-        stiffness.is_finite() && stiffness >= 0.0,
-        "invalid stiffness"
-    );
-
-    let points = vertices
-        .chunks_exact(2)
-        .map(|v| Point { x: v[0], y: v[1] })
-        .collect::<Vec<_>>();
-    let triangles = indices
-        .chunks_exact(3)
-        .map(|t| {
-            let triangle = [
-                usize::try_from(t[0]).context("negative mesh index")?,
-                usize::try_from(t[1]).context("negative mesh index")?,
-                usize::try_from(t[2]).context("negative mesh index")?,
-            ];
-            anyhow::ensure!(
-                triangle.iter().all(|&i| i < points.len()),
-                "mesh index out of bounds"
-            );
-            Ok(triangle)
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    let all_sources = to_points(pin_source);
-    let all_destinations = to_points(pin_destination);
-    let mut sources = Vec::new();
-    let mut destinations = Vec::new();
-    let mut overlap_sources = Vec::new();
-    let mut overlap_layers = Vec::new();
-    let mut overlap_ranges = Vec::new();
-    for index in 0..pin_count {
-        let encoded_range = pin_ranges.get(index).copied().unwrap_or(0.0);
-        if encoded_range < 0.0 {
-            overlap_sources.push(all_sources[index]);
-            overlap_layers.push(pin_layers[index]);
-            overlap_ranges.push((-encoded_range - 1.0).max(0.0));
-        } else {
-            sources.push(all_sources[index]);
-            destinations.push(all_destinations[index]);
-        }
-    }
-    if sources.is_empty() {
-        sources.push(points[0]);
-        destinations.push(points[0]);
-    }
-    let distances = geodesic_distances(&points, &triangles, &sources);
-    let overlap_distances = geodesic_distances(&points, &triangles, &overlap_sources);
-    let moved = sources
-        .iter()
-        .zip(&destinations)
-        .any(|(a, b)| a.x != b.x || a.y != b.y);
-
-    let evaluate = |point: Point, distance: &[f64], layer: f64| {
-        mls_rigid(
-            point,
-            distance,
-            &sources,
-            &destinations,
-            stiffness,
-            moved,
-            layer,
-        )
-    };
-    let deformed = points
-        .iter()
-        .enumerate()
-        .map(|(i, &point)| {
-            let d = distances.iter().map(|pin| pin[i]).collect::<Vec<_>>();
-            let overlap_d = overlap_distances
-                .iter()
-                .map(|pin| pin[i])
-                .collect::<Vec<_>>();
-            evaluate(
-                point,
-                &d,
-                overlap_layer(&overlap_d, &overlap_layers, &overlap_ranges),
-            )
-        })
-        .collect::<Vec<_>>();
-    let mut flat_deformed = Vec::with_capacity(points.len() * 2);
-    for (point, _) in &deformed {
-        flat_deformed.extend([point.x, point.y]);
-    }
-
-    let divisions = divisions.clamp(1, 32) as usize;
-    let mut rendered = Vec::<([f64; 12], f64)>::new();
-    for triangle in triangles {
-        let original = [
-            points[triangle[0]],
-            points[triangle[1]],
-            points[triangle[2]],
-        ];
-        let mut samples = vec![Vec::<Sample>::new(); divisions + 1];
-        for (row, sample_row) in samples.iter_mut().enumerate() {
-            for col in 0..=divisions - row {
-                let b = [
-                    1.0 - (row + col) as f64 / divisions as f64,
-                    col as f64 / divisions as f64,
-                    row as f64 / divisions as f64,
-                ];
-                let point = interpolate_points(original, b);
-                let d = distances
-                    .iter()
-                    .map(|pin| {
-                        b[0] * pin[triangle[0]] + b[1] * pin[triangle[1]] + b[2] * pin[triangle[2]]
-                    })
-                    .collect::<Vec<_>>();
-                let overlap_d = overlap_distances
-                    .iter()
-                    .map(|pin| {
-                        b[0] * pin[triangle[0]] + b[1] * pin[triangle[1]] + b[2] * pin[triangle[2]]
-                    })
-                    .collect::<Vec<_>>();
-                let layer_offset = overlap_layer(&overlap_d, &overlap_layers, &overlap_ranges);
-                let (deformed, layer_offset) = evaluate(point, &d, layer_offset);
-                sample_row.push(Sample {
-                    original: point,
-                    deformed,
-                    layer: (point.y + height * 0.5) / height + layer_offset,
-                });
-            }
-        }
-        for row in 0..divisions {
-            for col in 0..divisions - row {
-                push_triangle(
-                    &mut rendered,
-                    [
-                        samples[row][col],
-                        samples[row][col + 1],
-                        samples[row + 1][col],
-                    ],
-                    width,
-                    height,
-                );
-                if col + 1 < divisions - row {
-                    push_triangle(
-                        &mut rendered,
-                        [
-                            samples[row][col + 1],
-                            samples[row + 1][col + 1],
-                            samples[row + 1][col],
-                        ],
-                        width,
-                        height,
-                    );
-                }
-            }
-        }
-    }
-    rendered.sort_by(|a, b| a.1.total_cmp(&b.1));
-    Ok(Deformation {
-        vertices: flat_deformed,
-        render_vertices: rendered.into_iter().flat_map(|(v, _)| v).collect(),
-    })
+    deform(
+        vertices,
+        indices,
+        pin_source,
+        pin_destination,
+        pin_layers,
+        divisions,
+        width,
+        height,
+        &[],
+        Method::RigidMls(stiffness),
+    )
 }
 
 #[allow(clippy::too_many_arguments)] // Mirrors the flat AviUtl2 module ABI.
+#[cfg(test)]
 pub(crate) fn deform_arap(
     vertices: &[f64],
     indices: &[i32],
@@ -256,6 +65,46 @@ pub(crate) fn deform_arap(
     width: f64,
     height: f64,
 ) -> anyhow::Result<Deformation> {
+    deform(
+        vertices,
+        indices,
+        pin_source,
+        pin_destination,
+        pin_layers,
+        divisions,
+        width,
+        height,
+        &[],
+        Method::Arap,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn deform(
+    vertices: &[f64],
+    indices: &[i32],
+    pin_source: &[f64],
+    pin_destination: &[f64],
+    pin_layers: &[f64],
+    divisions: i32,
+    width: f64,
+    height: f64,
+    pose_data: &[f64],
+    method: Method,
+) -> anyhow::Result<Deformation> {
+    if let Method::RigidMls(exponent) = method {
+        anyhow::ensure!(exponent.is_finite() && exponent >= 0., "invalid stiffness");
+    }
+    let poses = crate::pose::parse(pose_data)?;
+    validate(
+        vertices,
+        indices,
+        pin_source,
+        pin_destination,
+        pin_layers,
+        width,
+        height,
+    )?;
     let pin_count = pin_source.len() / 2;
     anyhow::ensure!(
         pin_layers.len() == pin_count || pin_layers.len() == pin_count * 2,
@@ -266,15 +115,7 @@ pub(crate) fn deform_arap(
     } else {
         (pin_layers, &[][..])
     };
-    anyhow::ensure!(
-        width > 0.0 && height > 0.0,
-        "image dimensions must be positive"
-    );
     let original = to_points(vertices);
-    anyhow::ensure!(
-        original.len() >= 3 && original.len() * 2 == vertices.len(),
-        "invalid vertices"
-    );
     let triangles = indices
         .chunks_exact(3)
         .map(|t| {
@@ -290,7 +131,6 @@ pub(crate) fn deform_arap(
             Ok(triangle)
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    anyhow::ensure!(triangles.len() * 3 == indices.len(), "invalid indices");
     let all_sources = to_points(pin_source);
     let mut geometry_sources = Vec::new();
     let mut geometry_destinations = Vec::new();
@@ -309,40 +149,45 @@ pub(crate) fn deform_arap(
                 .extend([pin_destination[index * 2], pin_destination[index * 2 + 1]]);
         }
     }
-    if geometry_sources.is_empty() {
-        geometry_sources.extend([original[0].x, original[0].y]);
-        geometry_destinations.extend([original[0].x, original[0].y]);
-    }
     let overlap_distances = geodesic_distances(&original, &triangles, &overlap_sources);
 
-    let geometry_points = to_points(&geometry_sources);
-    let target_points = to_points(&geometry_destinations);
-    let distances = geodesic_distances(&original, &triangles, &geometry_points);
-    let moved = geometry_points.iter().zip(&target_points).any(|(a, b)| a.x != b.x || a.y != b.y);
-
-    let mut initial_guess = Vec::with_capacity(original.len());
-    for (i, &point) in original.iter().enumerate() {
-        let d = distances.iter().map(|pin| pin[i]).collect::<Vec<_>>();
-        let (deformed, _) = mls_rigid(point, &d, &geometry_points, &target_points, 1.0, moved, 0.0);
-        initial_guess.push(crate::arap::Point { x: deformed.x, y: deformed.y });
-    }
-
-    let solved = crate::arap::solve(
-        vertices,
-        indices,
-        &geometry_sources,
-        &geometry_destinations,
-        &initial_guess,
-    )?;
-    let deformed = solved
-        .iter()
-        .map(|p| Point { x: p.x, y: p.y })
-        .collect::<Vec<_>>();
+    let mls = match method {
+        Method::RigidMls(exponent) => Some(RigidMls::new(
+            &geometry_sources,
+            &geometry_destinations,
+            &poses,
+            exponent,
+        )),
+        Method::Arap => None,
+    };
+    let deformed = if let Some(field) = &mls {
+        original
+            .iter()
+            .map(|&p| field.evaluate(p))
+            .collect::<Vec<_>>()
+    } else {
+        crate::arap::solve_with_poses(
+            vertices,
+            indices,
+            &geometry_sources,
+            &geometry_destinations,
+            &poses,
+        )?
+    };
     let mut flat_deformed = Vec::with_capacity(vertices.len());
     for point in &deformed {
         flat_deformed.extend([point.x, point.y]);
     }
 
+    if divisions == 0 {
+        return Ok(Deformation {
+            vertices: flat_deformed,
+            render_vertices: Vec::new(),
+            wire_vertices: Vec::new(),
+        });
+    }
+    let mut wire_vertices = Vec::new();
+    let mut wire_edges = std::collections::HashSet::new();
     let divisions = divisions.clamp(1, 32) as usize;
     let mut rendered = Vec::<([f64; 12], f64)>::new();
     for triangle in triangles {
@@ -365,15 +210,12 @@ pub(crate) fn deform_arap(
                     row as f64 / divisions as f64,
                 ];
                 let original = interpolate_points(source, barycentric);
-                let deformed = interpolate_points(target, barycentric);
-                let sample_distances = overlap_distances
-                    .iter()
-                    .map(|pin| {
-                        barycentric[0] * pin[triangle[0]]
-                            + barycentric[1] * pin[triangle[1]]
-                            + barycentric[2] * pin[triangle[2]]
-                    })
-                    .collect::<Vec<_>>();
+                let deformed = mls.as_ref().map_or_else(
+                    || interpolate_points(target, barycentric),
+                    |field| field.evaluate(original),
+                );
+                let sample_distances =
+                    interpolate_distances(&overlap_distances, triangle, barycentric);
                 sample_row.push(Sample {
                     original,
                     deformed,
@@ -382,6 +224,13 @@ pub(crate) fn deform_arap(
                 });
             }
         }
+        append_wire(
+            &mut wire_vertices,
+            &mut wire_edges,
+            triangle,
+            &samples,
+            divisions,
+        );
         for row in 0..divisions {
             for col in 0..divisions - row {
                 push_triangle(
@@ -412,6 +261,7 @@ pub(crate) fn deform_arap(
     rendered.sort_by(|a, b| a.1.total_cmp(&b.1));
     Ok(Deformation {
         vertices: flat_deformed,
+        wire_vertices,
         render_vertices: rendered.into_iter().flat_map(|(v, _)| v).collect(),
     })
 }
@@ -421,6 +271,43 @@ fn to_points(values: &[f64]) -> Vec<Point> {
         .chunks_exact(2)
         .map(|v| Point { x: v[0], y: v[1] })
         .collect()
+}
+
+fn validate(
+    vertices: &[f64],
+    indices: &[i32],
+    sources: &[f64],
+    destinations: &[f64],
+    layers: &[f64],
+    width: f64,
+    height: f64,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        vertices.len() >= 6 && vertices.len().is_multiple_of(2),
+        "invalid vertices"
+    );
+    anyhow::ensure!(
+        indices.len() >= 3 && indices.len().is_multiple_of(3),
+        "invalid indices"
+    );
+    anyhow::ensure!(
+        sources.len().is_multiple_of(2) && sources.len() == destinations.len(),
+        "invalid pin arrays"
+    );
+    anyhow::ensure!(
+        vertices
+            .iter()
+            .chain(sources)
+            .chain(destinations)
+            .chain(layers)
+            .all(|v| v.is_finite()),
+        "non-finite coordinates"
+    );
+    anyhow::ensure!(
+        width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0,
+        "invalid dimensions"
+    );
+    Ok(())
 }
 
 fn push_triangle(out: &mut Vec<([f64; 12], f64)>, samples: [Sample; 3], width: f64, height: f64) {
@@ -440,6 +327,18 @@ fn interpolate_points(points: [Point; 3], b: [f64; 3]) -> Point {
         x: b[0] * points[0].x + b[1] * points[1].x + b[2] * points[2].x,
         y: b[0] * points[0].y + b[1] * points[1].y + b[2] * points[2].y,
     }
+}
+
+fn interpolate_distances(fields: &[Vec<f64>], triangle: [usize; 3], b: [f64; 3]) -> Vec<f64> {
+    fields
+        .iter()
+        .map(|field| {
+            (0..3)
+                .filter(|&i| b[i] > 0.0)
+                .map(|i| b[i] * field[triangle[i]])
+                .sum()
+        })
+        .collect()
 }
 
 fn geodesic_distances(points: &[Point], triangles: &[[usize; 3]], pins: &[Point]) -> Vec<Vec<f64>> {
@@ -465,22 +364,18 @@ fn geodesic_distances(points: &[Point], triangles: &[[usize; 3]], pins: &[Point]
                 .unwrap();
             let mut result = vec![f64::INFINITY; points.len()];
             result[start] = initial;
-            let mut queue = BinaryHeap::from([QueueEntry {
-                distance: initial,
-                vertex: start,
-            }]);
-            while let Some(entry) = queue.pop() {
-                if entry.distance > result[entry.vertex] {
+            // Nonnegative IEEE-754 distances sort like their unsigned bits.
+            let mut queue = BinaryHeap::from([Reverse((initial.to_bits(), start))]);
+            while let Some(Reverse((bits, vertex))) = queue.pop() {
+                let distance = f64::from_bits(bits);
+                if distance > result[vertex] {
                     continue;
                 }
-                for &(next, edge) in &adjacency[entry.vertex] {
-                    let candidate = entry.distance + edge;
+                for &(next, edge) in &adjacency[vertex] {
+                    let candidate = distance + edge;
                     if candidate < result[next] {
                         result[next] = candidate;
-                        queue.push(QueueEntry {
-                            distance: candidate,
-                            vertex: next,
-                        });
+                        queue.push(Reverse((candidate.to_bits(), next)));
                     }
                 }
             }
@@ -491,73 +386,6 @@ fn geodesic_distances(points: &[Point], triangles: &[[usize; 3]], pins: &[Point]
 
 fn distance(a: Point, b: Point) -> f64 {
     (a.x - b.x).hypot(a.y - b.y)
-}
-
-fn mls_rigid(
-    point: Point,
-    distances: &[f64],
-    source: &[Point],
-    destination: &[Point],
-    stiffness: f64,
-    moved: bool,
-    layer: f64,
-) -> (Point, f64) {
-    if !moved {
-        return (point, layer);
-    }
-    if let Some(index) = distances.iter().position(|&d| d < 1.0e-5) {
-        return (destination[index], layer);
-    }
-    let weights = distances
-        .iter()
-        .map(|d| 1.0 / d.powf(2.0 * stiffness))
-        .collect::<Vec<_>>();
-    let sum = weights.iter().sum::<f64>();
-    if sum < EPSILON || !sum.is_finite() {
-        return (point, layer);
-    }
-    let weighted = |points: &[Point]| Point {
-        x: weights
-            .iter()
-            .zip(points)
-            .map(|(w, p)| w * p.x)
-            .sum::<f64>()
-            / sum,
-        y: weights
-            .iter()
-            .zip(points)
-            .map(|(w, p)| w * p.y)
-            .sum::<f64>()
-            / sum,
-    };
-    let p_center = weighted(source);
-    let q_center = weighted(destination);
-    let mut m11 = 0.0;
-    let mut m12 = 0.0;
-    for ((&weight, p), q) in weights.iter().zip(source).zip(destination) {
-        let (px, py) = (p.x - p_center.x, p.y - p_center.y);
-        let (qx, qy) = (q.x - q_center.x, q.y - q_center.y);
-        m11 += weight * (qx * px + qy * py);
-        m12 += weight * (-qx * py + qy * px);
-    }
-    let norm = m11.hypot(m12);
-    if norm < EPSILON {
-        return (
-            Point {
-                x: point.x + q_center.x - p_center.x,
-                y: point.y + q_center.y - p_center.y,
-            },
-            layer,
-        );
-    }
-    let (x, y) = (point.x - p_center.x, point.y - p_center.y);
-    (
-        Point {
-            x: (x * m11 - y * m12) / norm + q_center.x,
-            y: (x * m12 + y * m11) / norm + q_center.y,
-        },
-        layer,
-    )
 }
 
 fn overlap_layer(distances: &[f64], layers: &[f64], ranges: &[f64]) -> f64 {
@@ -578,9 +406,71 @@ fn overlap_layer(distances: &[f64], layers: &[f64], ranges: &[f64]) -> f64 {
         .sum()
 }
 
+fn append_wire(
+    out: &mut Vec<f64>,
+    seen: &mut std::collections::HashSet<(usize, usize)>,
+    triangle: [usize; 3],
+    samples: &[Vec<Sample>],
+    divisions: usize,
+) {
+    for (edge, (a, b)) in [
+        (triangle[0], triangle[1]),
+        (triangle[0], triangle[2]),
+        (triangle[1], triangle[2]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if !seen.insert((a.min(b), a.max(b))) {
+            continue;
+        }
+        let sample = |k: usize| match edge {
+            0 => samples[0][k].deformed,
+            1 => samples[k][0].deformed,
+            _ => samples[k][divisions - k].deformed,
+        };
+        for k in 0..divisions {
+            let a = sample(k);
+            let b = sample(k + 1);
+            out.extend([a.x, a.y, b.x, b.y]);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mls_render_samples_evaluate_the_field_without_arap_or_mesh_interpolation() {
+        let source = [0., 0., 10., 0., 0., 10.];
+        let target = [1., 0., 12., 3., -2., 7.];
+        crate::arap::take_solve_calls();
+        let output = deform_mls(
+            &source,
+            &[0, 1, 2],
+            &source,
+            &target,
+            &[0.; 3],
+            1.,
+            2,
+            20.,
+            20.,
+        )
+        .unwrap();
+        assert_eq!(crate::arap::take_solve_calls(), 0);
+        let q = RigidMls::new(&source, &target, &[], 1.).evaluate(Point { x: 5., y: 0. });
+        let sample = output
+            .render_vertices
+            .chunks_exact(4)
+            .find(|p| p[2] == 0.75 && p[3] == 0.5)
+            .unwrap();
+        assert!((sample[0] - q.x).hypot(sample[1] - q.y) < 1e-12);
+        assert!(
+            (q.x - 6.5).hypot(q.y - 1.5) > 1e-4,
+            "rendering interpolated the vertex solution"
+        );
+    }
 
     const TRIANGLE: [f64; 6] = [0.0, 0.0, 10.0, 0.0, 0.0, 10.0];
     const INDICES: [i32; 3] = [0, 1, 2];
@@ -690,6 +580,48 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.vertices, TRIANGLE);
+    }
+
+    #[test]
+    fn overlap_pin_changes_triangle_order_in_both_directions() {
+        let vertices = [-10.0, -10.0, 10.0, -10.0, 10.0, 10.0, -10.0, 10.0];
+        let indices = [0, 1, 2, 0, 2, 3];
+        let bottom_right_is_first = |render: &[f64]| {
+            render[..12]
+                .chunks_exact(4)
+                .any(|v| (v[2] - 1.0).abs() < 1e-8 && v[3].abs() < 1e-8)
+        };
+        for method in 1..=2 {
+            let deform = |layer| {
+                if method == 1 {
+                    deform_mls(
+                        &vertices,
+                        &indices,
+                        &[10.0, -10.0],
+                        &[10.0, -10.0],
+                        &[layer, -16.0],
+                        1.0,
+                        1,
+                        20.0,
+                        20.0,
+                    )
+                } else {
+                    deform_arap(
+                        &vertices,
+                        &indices,
+                        &[10.0, -10.0],
+                        &[10.0, -10.0],
+                        &[layer, -16.0],
+                        1,
+                        20.0,
+                        20.0,
+                    )
+                }
+                .unwrap()
+            };
+            assert!(bottom_right_is_first(&deform(-2.0).render_vertices));
+            assert!(!bottom_right_is_first(&deform(2.0).render_vertices));
+        }
     }
 
     #[test]

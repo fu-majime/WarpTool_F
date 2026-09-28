@@ -13,8 +13,8 @@ use crate::{
 // AviUtl2's edit API addresses script settings by their alias/display names,
 // not by the Lua variable names after `@`.
 const PINS_ITEM_NAME: &str = "ピン数";
-const SOURCE_ITEM_NAME: &str = "ピン元";
-const DESTINATION_ITEM_NAME: &str = "ピン先";
+const SOURCE_ITEM_NAME: &str = "ピン移動元";
+const DESTINATION_ITEM_NAME: &str = "ピン移動先";
 const PIN_TYPES_ITEM_NAME: &str = "ピン種類";
 const BONE_FOREST_ITEM_NAME: &str = "ボーン親子関係";
 const CONTROL_PIN_NUMBER_ITEM_NAME: &str = "番号";
@@ -29,9 +29,7 @@ const NEW_OBJECT_LENGTH: usize = 81;
 
 #[derive(Clone, Debug)]
 pub enum WorkerCommand {
-    SelectFocused {
-        effect_index: usize,
-    },
+    SelectFocused,
     Refresh,
     Apply {
         target: EditTarget,
@@ -49,7 +47,7 @@ pub enum WorkerCommand {
 pub fn run(receiver: Receiver<WorkerCommand>, shared: Arc<SharedState>) {
     while let Ok(command) = receiver.recv() {
         match command {
-            WorkerCommand::SelectFocused { effect_index } => select_focused(&shared, effect_index),
+            WorkerCommand::SelectFocused => select_focused(&shared),
             WorkerCommand::Refresh => refresh(&shared),
             WorkerCommand::Apply { target, operation } => apply(&shared, target, operation),
             WorkerCommand::AddPinControl {
@@ -178,9 +176,9 @@ fn add_pin_control(shared: &SharedState, target: EditTarget, pin_index: usize, k
             .context("制御フィルタへピン番号を書き込めませんでした")?;
             if control_has_xy(kind) {
                 edit.set_effect_item_value(control, CONTROL_X_ITEM_NAME, &format_number(source.x))
-                    .context("制御フィルタへピン元X座標を書き込めませんでした")?;
+                    .context("制御フィルタへピン移動元X座標を書き込めませんでした")?;
                 edit.set_effect_item_value(control, CONTROL_Y_ITEM_NAME, &format_number(source.y))
-                    .context("制御フィルタへピン元Y座標を書き込めませんでした")?;
+                    .context("制御フィルタへピン移動元Y座標を書き込めませんでした")?;
             }
             for existing in &existing_controls {
                 edit.delete_effect(target_for_edit.object, *existing)
@@ -258,7 +256,7 @@ fn add_object(shared: &SharedState) {
     }
 }
 
-fn select_focused(shared: &SharedState, effect_index: usize) {
+fn select_focused(shared: &SharedState) {
     if !EDIT_HANDLE.is_ready() {
         return;
     }
@@ -274,17 +272,11 @@ fn select_focused(shared: &SharedState, effect_index: usize) {
         if effect_count == 0 {
             aviutl2::anyhow::bail!("選択中のオブジェクトに対象効果がありません");
         }
-        if effect_index >= effect_count {
-            aviutl2::anyhow::bail!(
-                "効果番号 {} は存在しません（対象効果は {} 個）",
-                effect_index + 1,
-                effect_count
-            );
-        }
+        ensure_single_puppet_effect(effect_count)?;
         Ok(EditTarget {
             object,
             effect_name: PUPPET_EFFECT_NAME.to_owned(),
-            effect_index,
+            effect_index: 0,
         })
     });
     match result {
@@ -309,11 +301,15 @@ fn clear_target(shared: &SharedState, status: String) {
 
 fn select_target(shared: &SharedState, target: EditTarget, capture_after: u64) {
     shared.update_editor(|editor| {
+        // Focus notifications also arrive for the current object. Keep its
+        // model and capture valid while reloading to avoid blanking the canvas.
+        if editor.target.as_ref() != Some(&target) {
+            editor.model = None;
+            editor.capture_after = capture_after;
+        }
         editor.target = Some(target.clone());
-        editor.model = None;
         editor.busy = true;
         editor.status = "対象のパラメーターを読み込んでいます。".to_owned();
-        editor.capture_after = capture_after;
     });
     match load_model(shared, &target) {
         Ok(model) => shared.update_editor(|editor| {
@@ -338,7 +334,7 @@ fn select_target(shared: &SharedState, target: EditTarget, capture_after: u64) {
 
 fn refresh(shared: &SharedState) {
     let Some(target) = shared.editor_snapshot().target else {
-        select_focused(shared, 0);
+        select_focused(shared);
         return;
     };
     match load_model(shared, &target) {
@@ -390,7 +386,7 @@ fn apply(shared: &SharedState, target: EditTarget, operation: PinOperation) {
             SOURCE_ITEM_NAME,
             &model.src_string(),
         )
-        .context("「ピン元」の書き込みに失敗しました")?;
+        .context("「ピン移動元」の書き込みに失敗しました")?;
         edit.set_object_effect_item(
             target_for_edit.object,
             &target_for_edit.effect_name,
@@ -398,7 +394,7 @@ fn apply(shared: &SharedState, target: EditTarget, operation: PinOperation) {
             DESTINATION_ITEM_NAME,
             &model.dst_string(),
         )
-        .context("「ピン先」の書き込みに失敗しました")?;
+        .context("「ピン移動先」の書き込みに失敗しました")?;
         edit.set_object_effect_item(
             target_for_edit.object,
             &target_for_edit.effect_name,
@@ -558,10 +554,15 @@ fn verify_target(read: &aviutl2::generic::ReadSection, target: &EditTarget) -> A
     let effect_count = read
         .count_object_effect(target.object, &target.effect_name)
         .context("対象効果の確認に失敗しました")?;
-    if target.effect_index >= effect_count {
-        aviutl2::anyhow::bail!("対象効果が削除されたか、効果番号が変わりました");
+    ensure_single_puppet_effect(effect_count)
+}
+
+fn ensure_single_puppet_effect(effect_count: usize) -> AnyResult<()> {
+    match effect_count {
+        0 => aviutl2::anyhow::bail!("対象のパペットツールが見つかりません"),
+        1 => Ok(()),
+        _ => aviutl2::anyhow::bail!("パペットツールは1個までです。"),
     }
-    Ok(())
 }
 
 struct LoadedModel {
@@ -589,7 +590,7 @@ fn read_model(
             target.effect_index,
             SOURCE_ITEM_NAME,
         )
-        .context("「ピン元」の読み込みに失敗しました")?;
+        .context("「ピン移動元」の読み込みに失敗しました")?;
     let dst = read
         .get_object_effect_item(
             target.object,
@@ -597,7 +598,7 @@ fn read_model(
             target.effect_index,
             DESTINATION_ITEM_NAME,
         )
-        .context("「ピン先」の読み込みに失敗しました")?;
+        .context("「ピン移動先」の読み込みに失敗しました")?;
     let pin_types = read
         .get_object_effect_item(
             target.object,
@@ -626,6 +627,14 @@ fn read_model(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn puppet_editor_requires_exactly_one_effect() {
+        assert!(ensure_single_puppet_effect(0).is_err());
+        assert!(ensure_single_puppet_effect(1).is_ok());
+        assert!(ensure_single_puppet_effect(2).is_err());
+        assert!(ensure_single_puppet_effect(20).is_err());
+    }
 
     #[test]
     fn every_supported_pin_kind_maps_to_its_control_effect() {

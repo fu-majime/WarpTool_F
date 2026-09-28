@@ -1,6 +1,4 @@
--- =============================================================
--- 5. 描画バッファ設定
--- =============================================================
+-- 描画バッファ設定
 local dstw, dsth = w, h
 local sx_off, sy_off = 0, 0
 
@@ -9,13 +7,12 @@ if obj.getinfo("filter") then
 else
 	local minbx, minby = 1e9, 1e9
 	local maxbx, maxby = -1e9, -1e9
-	for i = 1, mesh_n_verts do
-		if def_x[i] and def_x[i] < minbx then minbx = def_x[i] end
-		if def_x[i] and def_x[i] > maxbx then maxbx = def_x[i] end
-		if def_y[i] and def_y[i] < minby then minby = def_y[i] end
-		if def_y[i] and def_y[i] > maxby then maxby = def_y[i] end
+	for i = 1, #render_vertices, 4 do
+		minbx = math.min(minbx, render_vertices[i])
+		maxbx = math.max(maxbx, render_vertices[i])
+		minby = math.min(minby, render_vertices[i+1])
+		maxby = math.max(maxby, render_vertices[i+1])
 	end
-	-- ガイドも描画バッファへ収め、長く移動したピンの線や点を欠けさせない。
 	if show_gui then
 		for i = 1, pins do
 			minbx = math.min(minbx, pin_sx[i], pin_tx[i])
@@ -51,9 +48,7 @@ else
 	sy_off = (minby + maxby) / 2
 end
 
--- =============================================================
--- 6. Rust側で細分化・Zソート済みの三角形を描画
--- =============================================================
+-- メッシュを描画
 local flat_vtx = {}
 if #render_vertices % 12 ~= 0 then
 	error("puppet_geometry: 描画頂点配列の長さが不正です (" .. #render_vertices .. ")")
@@ -65,14 +60,12 @@ for i = 1, #render_vertices, 4 do
 	}
 end
 if #flat_vtx >= 3 then
-	obj.setoption("blend", "alpha_add")
+	obj.setoption("blend", "none")
 	obj.drawpoly(flat_vtx, 3)
 end
 
--- =============================================================
--- 7. 可視化（show=true）
--- =============================================================
-if show_gui then
+-- GUI可視化（show=true）
+if show_gui or show_overlap_range then
 	local COLORS = {
 		pink   = 0xff69b4,
 		orange = 0xffa020,
@@ -110,91 +103,61 @@ if show_gui then
 		return r * a, g * a, b * a, a
 	end
 
-	local function overlap_visual(x, y)
-		local influence = 0
-		for _, pin in ipairs(pin_data) do
-			if pin.kind == PIN_TYPE.OVERLAP and pin.show_range
-				and pin.range > 0 and pin.layer ~= 0 then
-				local dx, dy = x - pin.sx, y - pin.sy
-				local distance = math.sqrt(dx * dx + dy * dy)
-				if distance < pin.range then
-					local t = math.max(0, math.min(1, 1 - distance / pin.range))
-					local falloff = t * t * (3 - 2 * t)
-					influence = influence + pin.layer * falloff
+	-- 重なり
+	if show_overlap_range then
+		local overlap_influence = puppet_pin_dynamics.overlap_influence(
+			mesh_vertices, mesh_indices, pin_data, PIN_TYPE.OVERLAP)
+		local overlap_plane = {}
+		for _, tri in ipairs(mesh_tris) do
+			local triangle_vertices, visible = {}, false
+			for vertex = 1, 3 do
+				local index = tri[vertex]
+				local influence = overlap_influence[index] or 0
+				local alpha = math.abs(influence) * 0.65
+				visible = visible or alpha > 0.001
+				local color = influence > 0 and alpha or 0
+				triangle_vertices[vertex] = {
+					def_x[index] - sx_off, def_y[index] - sy_off, 0,
+					color, color, color, alpha,
+				}
+			end
+			if visible then
+				for vertex = 1, 3 do
+					overlap_plane[#overlap_plane + 1] = triangle_vertices[vertex]
 				end
 			end
 		end
-		return math.max(-1, math.min(1, influence))
+		if #overlap_plane >= 3 then
+			obj.setoption("blend", "alpha_add")
+			obj.drawpoly(overlap_plane, 3)
+		end
 	end
 
-	-- 変形後メッシュと同じ三角形に白黒半透明面を貼る。
-	-- ワイヤー自体の色は変えず、重なりの強さを面のアルファで示す。
-	local overlap_plane = {}
-	for _, tri in ipairs(mesh_tris) do
-		local triangle_vertices, visible = {}, false
-		for vertex = 1, 3 do
-			local index = tri[vertex]
-			local influence = overlap_visual(mesh_x[index], mesh_y[index])
-			local alpha = math.abs(influence) * 0.65
-			visible = visible or alpha > 0.001
-			local color = influence > 0 and alpha or 0
-			triangle_vertices[vertex] = {
-				def_x[index] - sx_off, def_y[index] - sy_off, 0,
-				color, color, color, alpha,
-			}
-		end
-		if visible then
-			for vertex = 1, 3 do
-				overlap_plane[#overlap_plane + 1] = triangle_vertices[vertex]
-			end
-		end
-	end
-	if #overlap_plane >= 3 then
-		obj.setoption("blend", "alpha_add")
-		obj.drawpoly(overlap_plane, 3)
-	end
+	if show_gui then
 
 	-- ワイヤーフレーム
 	local wire = {}
 	local lw = 1.2
 	local cr, cg, cb, ca = premultiplied_rgba(COLOR_THEME.mesh)
-	local drawn_edges = {}
-
-	for ti = 1, #mesh_tris do
-		local tri = mesh_tris[ti]
-		local vx = {
-			def_x[tri[1]] - sx_off, def_y[tri[1]] - sy_off,
-			def_x[tri[2]] - sx_off, def_y[tri[2]] - sy_off,
-			def_x[tri[3]] - sx_off, def_y[tri[3]] - sy_off
-		}
-		for e = 0, 2 do
-			local ne = ((e + 1) % 3)
-			local ia, ib = tri[e + 1], tri[ne + 1]
-			local edge_key = math.min(ia, ib) .. ":" .. math.max(ia, ib)
-			if not drawn_edges[edge_key] then
-				drawn_edges[edge_key] = true
-				local ax, ay = vx[e * 2 + 1], vx[e * 2 + 2]
-				local bx, by = vx[ne * 2 + 1], vx[ne * 2 + 2]
-				local edx, edy = bx - ax, by - ay
-				local elen = math.sqrt(edx * edx + edy * edy)
-				if elen > 0.1 then
-					local nx = -edy / elen * lw
-					local ny =  edx / elen * lw
-					table.insert(wire, { ax + nx, ay + ny, 0, cr, cg, cb, ca })
-					table.insert(wire, { bx + nx, by + ny, 0, cr, cg, cb, ca })
-					table.insert(wire, { bx - nx, by - ny, 0, cr, cg, cb, ca })
-					table.insert(wire, { ax - nx, ay - ny, 0, cr, cg, cb, ca })
-				end
-			end
+	for i = 1, #wire_vertices, 4 do
+		local ax,ay = wire_vertices[i]-sx_off,wire_vertices[i+1]-sy_off
+		local bx,by = wire_vertices[i+2]-sx_off,wire_vertices[i+3]-sy_off
+		local edx,edy = bx-ax,by-ay
+		local elen = math.sqrt(edx*edx+edy*edy)
+		if elen>0.1 then
+			local nx,ny = -edy/elen*lw,edx/elen*lw
+			wire[#wire+1] = {ax+nx,ay+ny,0,cr,cg,cb,ca}
+			wire[#wire+1] = {bx+nx,by+ny,0,cr,cg,cb,ca}
+			wire[#wire+1] = {bx-nx,by-ny,0,cr,cg,cb,ca}
+			wire[#wire+1] = {ax-nx,ay-ny,0,cr,cg,cb,ca}
 		end
 	end
-
 	if #wire >= 4 then
 		obj.setoption("blend", "alpha_add")
 		obj.drawpoly(wire)
 	end
 
-	-- ボーンは親側を幅広く、子側を尖らせた平面三角形で表示する。
+	-- ボーン
 	local bone_faces = {}
 	local bone_r, bone_g, bone_b, bone_a = premultiplied_rgba {
 		color = COLORS.green, alpha = 0.42
@@ -245,30 +208,16 @@ if show_gui then
 	end
 
 	-- ベンド/詳細/スターチの自動追従を可視化する。
-	-- 中心線がピンの追従移動、薄い放射線が外周拘束の移動、
-	-- 色付きの輪郭が実際に回転・拡縮へ使った領域を表す。
+	-- 最終描画面上の位置までの追従移動を表示する。
 	local dynamics_lines = {}
 	for _, handle in ipairs(pin_dynamics_debug) do
 		if handle.kind ~= PIN_TYPE.STARCH and handle.kind ~= PIN_TYPE.OVERLAP then
 			local source_theme = COLOR_THEME.pinSource[handle.kind] or COLOR_THEME.arrowProgress
-			local influence_theme = { color = source_theme.color, alpha = 0.38 }
 			local center_line = make_line(
 				handle.sx - sx_off, handle.sy - sy_off,
 				handle.dx - sx_off, handle.dy - sy_off, 4, source_theme)
 			if center_line then dynamics_lines[#dynamics_lines + 1] = center_line end
-			for index, point in ipairs(handle.points) do
-				local movement = make_line(
-					point.sx - sx_off, point.sy - sy_off,
-					point.dx - sx_off, point.dy - sy_off, 1.5, influence_theme)
-				if movement then dynamics_lines[#dynamics_lines + 1] = movement end
-				if #handle.points > 1 then
-					local next_point = handle.points[index % #handle.points + 1]
-					local boundary = make_line(
-						point.dx - sx_off, point.dy - sy_off,
-						next_point.dx - sx_off, next_point.dy - sy_off, 2, influence_theme)
-					if boundary then dynamics_lines[#dynamics_lines + 1] = boundary end
-				end
-			end
+
 		end
 	end
 	if #dynamics_lines > 0 then
@@ -276,14 +225,13 @@ if show_gui then
 		obj.drawpoly(dynamics_lines)
 	end
 
-	-- src→dstの全経路と、src→現在位置（ratio反映）の矢印軸を一括描画する。
+	-- ピンの移動元/移動先を描画
 	local pin_lines = {}
 	local arrow_lines = {}
 	local arrow_heads = {}
 	for i = 1, pins do
 		local kind = pin_types[i]
-		if kind ~= PIN_TYPE.BONE and kind ~= PIN_TYPE.STARCH
-			and kind ~= PIN_TYPE.OVERLAP then
+		if kind ~= PIN_TYPE.BONE and kind ~= PIN_TYPE.STARCH and kind ~= PIN_TYPE.OVERLAP then
 		local ox, oy = pin_sx[i] - sx_off, pin_sy[i] - sy_off
 		local fx, fy = pin_tx[i] - sx_off, pin_ty[i] - sy_off
 		local cx, cy = pin_dx[i] - sx_off, pin_dy[i] - sy_off
@@ -296,7 +244,6 @@ if show_gui then
 			local arrow = make_line(ox, oy, cx, cy, 8, COLOR_THEME.arrowProgress)
 			if arrow then table.insert(arrow_lines, arrow) end
 
-			-- 三角形図形の上端中央が現在位置に来るよう、UV付き四角形を置く。
 			local hx, hy = adx / alen, ady / alen
 			local nx, ny = -hy, hx
 			local head_len = 24 * math.max(math.min(1, (ratio/100)/0.1, (1-ratio/100)/0.1), 0)
@@ -317,7 +264,6 @@ if show_gui then
 		obj.drawpoly(arrow_lines)
 	end
 
-	-- 矢じりと点は既成図形を使う。操作側の点だけ大きく、不透明にする。
 	local saved_props = {
 		obj.ox, obj.oy, obj.oz, obj.cx, obj.cy, obj.cz,
 		obj.rx, obj.ry, obj.rz, obj.sx, obj.sy, obj.sz, obj.alpha
@@ -330,21 +276,19 @@ if show_gui then
 		local alpha = active and 1.0 or theme.alpha
 		for i = 1, pins do
 			local kind = pin_types[i]
-			if kind ~= PIN_TYPE.BONE and kind ~= PIN_TYPE.BEND and kind ~= PIN_TYPE.STARCH
-				and kind ~= PIN_TYPE.OVERLAP then
+			if kind ~= PIN_TYPE.BONE and kind ~= PIN_TYPE.BEND and kind ~= PIN_TYPE.STARCH and kind ~= PIN_TYPE.OVERLAP then
 				obj.draw(xs[i] - sx_off, ys[i] - sy_off, 0, size / point_base_size, alpha)
 			end
 		end
 	end
 	local function draw_source_points(active)
 		local size = active and 32 or 16
-		for pin_type = PIN_TYPE.POSITION, PIN_TYPE.OVERLAP do
+		for pin_type = PIN_TYPE.POSITION, PIN_TYPE.DETAIL do
 			local theme = COLOR_THEME.pinSource[pin_type]
 			if theme and obj.load("figure", "円", theme.color, point_base_size) then
 				local alpha = active and 1.0 or theme.alpha
 				for i = 1, pins do
-					if pin_types[i] == pin_type and pin_type ~= PIN_TYPE.BONE
-						and pin_type ~= PIN_TYPE.STARCH and pin_type ~= PIN_TYPE.OVERLAP then
+					if pin_types[i] == pin_type and pin_type ~= PIN_TYPE.BONE and pin_type ~= PIN_TYPE.STARCH and pin_type ~= PIN_TYPE.OVERLAP then
 						obj.draw(pin_sx[i] - sx_off, pin_sy[i] - sy_off, 0,
 							size / point_base_size, alpha)
 					end
@@ -354,7 +298,8 @@ if show_gui then
 	end
 	draw_source_points(edit_source)
 	draw_destination_points(pin_tx, pin_ty, COLOR_THEME.pinDestination, not edit_source)
-	-- ボーンピンは移動元を描かず、現在位置を菱形で示す。
+
+	-- ボーン
 	local diamond_vertices = {}
 	local diamond_size = edit_source and 9 or 16
 	local dr, dg, db, da = premultiplied_rgba {
@@ -370,7 +315,6 @@ if show_gui then
 		end
 	end
 	if #diamond_vertices >= 4 then obj.drawpoly(diamond_vertices) end
-	-- 自動追従した中心は、ピン種別色の小さい不透明点で示す。
 	for pin_type = PIN_TYPE.BEND, PIN_TYPE.OVERLAP do
 		local theme = COLOR_THEME.pinSource[pin_type]
 		if theme and obj.load("figure", "円", theme.color, point_base_size) then
@@ -387,4 +331,5 @@ if show_gui then
 	end
 	obj.ox, obj.oy, obj.oz, obj.cx, obj.cy, obj.cz,
 	obj.rx, obj.ry, obj.rz, obj.sx, obj.sy, obj.sz, obj.alpha = unpack(saved_props)
+	end
 end

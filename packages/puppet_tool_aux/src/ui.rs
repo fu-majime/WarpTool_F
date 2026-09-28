@@ -149,27 +149,8 @@ impl PuppetEditorApp {
                 {
                     let _ = self.sender.send(WorkerCommand::AddObject);
                 }
-                let mut effect_number = editor
-                    .target
-                    .as_ref()
-                    .map_or(1, |target| target.effect_index + 1);
-                ui.label("効果番号");
-                if ui
-                    .add(
-                        egui::DragValue::new(&mut effect_number)
-                            .range(1..=20)
-                            .speed(0.1),
-                    )
-                    .changed()
-                {
-                    let _ = self.sender.send(WorkerCommand::SelectFocused {
-                        effect_index: effect_number - 1,
-                    });
-                }
                 if ui.button("再読込").clicked() {
-                    let _ = self.sender.send(WorkerCommand::SelectFocused {
-                        effect_index: effect_number - 1,
-                    });
+                    let _ = self.sender.send(WorkerCommand::SelectFocused);
                 }
                 ui.separator();
                 ui.label("追加");
@@ -348,6 +329,14 @@ impl PuppetEditorApp {
         } else if response.clicked_by(egui::PointerButton::Primary) && !editor.busy {
             if let Some(index) = hovered_pin {
                 let shift = ui.input(|input| input.modifiers.shift);
+                if let Some(kind) = self
+                    .local_model
+                    .as_ref()
+                    .and_then(|model| model.kinds.get(index))
+                {
+                    self.pin_kind = *kind;
+                    ui.ctx().request_repaint();
+                }
                 let attachment = shift.then(|| {
                     let model = self.local_model.as_ref()?;
                     let parent = self.selected_pin?;
@@ -479,6 +468,7 @@ impl PuppetEditorApp {
             match operation {
                 PinOperation::Add { .. } | PinOperation::InsertBone { .. } => {
                     self.selected_pin = Some(model.src.len() - 1);
+                    self.pin_kind = model.kinds[model.src.len() - 1];
                 }
                 PinOperation::Delete(deleted) => {
                     self.selected_pin = match self.selected_pin {
@@ -491,6 +481,7 @@ impl PuppetEditorApp {
                 PinOperation::MoveSourceAndDestination { .. } => {}
             }
             self.send_operation(operation);
+            self.shared.repaint();
         }
     }
 
@@ -627,11 +618,9 @@ impl eframe::App for PuppetEditorApp {
         let editor = self.shared.editor_snapshot();
         let capture_status = self.shared.capture_snapshot().status;
         egui::Panel::bottom("puppet_status").show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(&editor.status);
-                ui.separator();
-                ui.weak(capture_status);
-            });
+            // A changing status must not resize the canvas and its fitted image.
+            ui.add(egui::Label::new(&editor.status).truncate());
+            ui.add(egui::Label::new(egui::RichText::new(capture_status).weak()).truncate());
         });
 
         let frame = self.refresh_texture(ui.ctx());

@@ -59,7 +59,7 @@ if obj.getoption("gui") then
     else
         local pin_index = math.floor(index)
         local ok_src, src = pcall(function()
-            return obj.getvalue("パペットツール@${PACKAGE_NAME}:0", "ピン元")
+            return obj.getvalue("パペットツール@${PACKAGE_NAME}:0", "ピン移動元")
         end)
         local offset = pin_index * 2
         local anchor_values = parse_numbers(anchor)
